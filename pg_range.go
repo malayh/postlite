@@ -22,7 +22,7 @@ func (m *pgRangeModule) Create(c *sqlite3.SQLiteConn, args []string) (sqlite3.VT
 	if err != nil {
 		return nil, err
 	}
-	return &pgNamespaceTable{}, nil
+	return &pgRangeTable{}, nil
 }
 
 func (m *pgRangeModule) Connect(c *sqlite3.SQLiteConn, args []string) (sqlite3.VTab, error) {
@@ -34,7 +34,7 @@ func (m *pgRangeModule) DestroyModule() {}
 type pgRangeTable struct{}
 
 func (t *pgRangeTable) Open() (sqlite3.VTabCursor, error) {
-	return &pgTypeCursor{}, nil
+	return &pgRangeCursor{}, nil
 }
 
 func (t *pgRangeTable) BestIndex(cst []sqlite3.InfoConstraint, ob []sqlite3.InfoOrderBy) (*sqlite3.IndexResult, error) {
@@ -79,7 +79,7 @@ func (c *pgRangeCursor) Next() error {
 }
 
 func (c *pgRangeCursor) EOF() bool {
-	return c.index >= len(pgTypes)
+	return c.index >= len(pgRanges)
 }
 
 func (c *pgRangeCursor) Rowid() (int64, error) {

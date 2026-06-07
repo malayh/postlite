@@ -2,7 +2,9 @@ package postlite
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"log"
@@ -19,9 +21,11 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-// Postgres settings.
+// Postgres settings. ServerVersion is reported to clients via the server_version
+// parameter and version() function; many drivers (and Knex/NocoDB) parse it to
+// select a SQL dialect, so it must look like a real, recent PostgreSQL version.
 const (
-	ServerVersion = "13.0.0"
+	ServerVersion = "14.0"
 )
 
 func init() {
@@ -85,7 +89,9 @@ func currentUser() string { return "sqlite3" }
 func sessionUser() string { return "sqlite3" }
 func user() string        { return "sqlite3" }
 
-func version() string { return "postlite v0.0.0" }
+func version() string {
+	return "PostgreSQL " + ServerVersion + " (postlite) on x86_64-pc-linux-gnu"
+}
 
 func formatType(type_oid, typemod string) string { return "" }
 
@@ -221,6 +227,14 @@ func (s *Server) serveConn(ctx context.Context, c *Conn) error {
 
 		log.Printf("[recv] %#v", msg)
 
+		// After an error in the extended protocol the backend discards all
+		// messages until the next Sync, then reports ReadyForQuery.
+		if c.skipUntilSync {
+			if _, ok := msg.(*pgproto3.Sync); !ok {
+				continue
+			}
+		}
+
 		switch msg := msg.(type) {
 		case *pgproto3.Query:
 			if err := s.handleQueryMessage(ctx, c, msg); err != nil {
@@ -232,7 +246,33 @@ func (s *Server) serveConn(ctx context.Context, c *Conn) error {
 				return fmt.Errorf("parse message: %w", err)
 			}
 
-		case *pgproto3.Sync: // ignore
+		case *pgproto3.Bind:
+			if err := s.handleBindMessage(ctx, c, msg); err != nil {
+				return fmt.Errorf("bind message: %w", err)
+			}
+
+		case *pgproto3.Describe:
+			if err := s.handleDescribeMessage(ctx, c, msg); err != nil {
+				return fmt.Errorf("describe message: %w", err)
+			}
+
+		case *pgproto3.Execute:
+			if err := s.handleExecuteMessage(ctx, c, msg); err != nil {
+				return fmt.Errorf("execute message: %w", err)
+			}
+
+		case *pgproto3.Close:
+			if err := s.handleCloseMessage(ctx, c, msg); err != nil {
+				return fmt.Errorf("close message: %w", err)
+			}
+
+		case *pgproto3.Sync:
+			c.skipUntilSync = false
+			if err := writeMessages(c, &pgproto3.ReadyForQuery{TxStatus: 'I'}); err != nil {
+				return fmt.Errorf("sync ready: %w", err)
+			}
+
+		case *pgproto3.Flush: // we never buffer responses; nothing to flush
 			continue
 
 		case *pgproto3.Terminate:
@@ -260,6 +300,10 @@ func (s *Server) serveConnStartup(ctx context.Context, c *Conn) error {
 		if err := s.handleSSLRequestMessage(ctx, c, msg); err != nil {
 			return fmt.Errorf("ssl request message: %w", err)
 		}
+		return nil
+	case *pgproto3.CancelRequest:
+		// We cannot cancel an in-flight query; acknowledge by closing cleanly.
+		log.Printf("received cancel request: %#v", msg)
 		return nil
 	default:
 		return fmt.Errorf("unexpected startup message: %#v", msg)
@@ -310,11 +354,35 @@ func (s *Server) handleStartupMessage(ctx context.Context, c *Conn, msg *pgproto
 		return fmt.Errorf("create pg_range: %w", err)
 	}
 
+	// Report the parameter set a real PostgreSQL server sends at startup. Drivers
+	// read several of these (e.g. standard_conforming_strings governs string
+	// escaping; server_version selects the SQL dialect). BackendKeyData provides
+	// the keys a client would use to issue a CancelRequest.
 	return writeMessages(c,
 		&pgproto3.AuthenticationOk{},
 		&pgproto3.ParameterStatus{Name: "server_version", Value: ServerVersion},
+		&pgproto3.ParameterStatus{Name: "server_encoding", Value: "UTF8"},
+		&pgproto3.ParameterStatus{Name: "client_encoding", Value: "UTF8"},
+		&pgproto3.ParameterStatus{Name: "DateStyle", Value: "ISO, MDY"},
+		&pgproto3.ParameterStatus{Name: "IntervalStyle", Value: "postgres"},
+		&pgproto3.ParameterStatus{Name: "TimeZone", Value: "UTC"},
+		&pgproto3.ParameterStatus{Name: "integer_datetimes", Value: "on"},
+		&pgproto3.ParameterStatus{Name: "standard_conforming_strings", Value: "on"},
+		&pgproto3.ParameterStatus{Name: "application_name", Value: getParameter(msg.Parameters, "application_name")},
+		&pgproto3.BackendKeyData{ProcessID: randUint32(), SecretKey: randUint32()},
 		&pgproto3.ReadyForQuery{TxStatus: 'I'},
 	)
+}
+
+// randUint32 returns a random uint32 for BackendKeyData. It falls back to a fixed
+// value if the system RNG is unavailable (the keys are only used for query
+// cancellation, which this server does not implement).
+func randUint32() uint32 {
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return 1
+	}
+	return binary.BigEndian.Uint32(b[:])
 }
 
 func (s *Server) handleSSLRequestMessage(ctx context.Context, c *Conn, msg *pgproto3.SSLRequest) error {
@@ -328,39 +396,72 @@ func (s *Server) handleSSLRequestMessage(ctx context.Context, c *Conn, msg *pgpr
 func (s *Server) handleQueryMessage(ctx context.Context, c *Conn, msg *pgproto3.Query) error {
 	log.Printf("received query: %q", msg.String)
 
-	// Execute query against database.
-	rows, err := c.db.QueryContext(ctx, msg.String)
-	if err != nil {
+	// Rewrite system-information queries so they're tolerable by SQLite. This is
+	// applied to the simple query protocol too (not just Parse), so e.g. SET works
+	// regardless of which protocol the client uses.
+	query := rewriteQuery(msg.String)
+	if strings.TrimSpace(query) == "" {
 		return writeMessages(c,
-			&pgproto3.ErrorResponse{Message: err.Error()},
+			&pgproto3.EmptyQueryResponse{},
 			&pgproto3.ReadyForQuery{TxStatus: 'I'},
 		)
 	}
+
+	// Statements that return no result set are run with Exec so we can report the
+	// number of affected rows; result sets are streamed with Query.
+	if !isRowReturning(query) {
+		return s.execSimpleQuery(ctx, c, query)
+	}
+	return s.streamSimpleQuery(ctx, c, query)
+}
+
+// execSimpleQuery runs a non-row-returning statement (INSERT/UPDATE/DELETE/DDL/
+// SET/...) and reports CommandComplete with the affected-row count.
+func (s *Server) execSimpleQuery(ctx context.Context, c *Conn, query string) error {
+	res, err := c.db.ExecContext(ctx, query)
+	if err != nil {
+		return writeErrorReady(c, 'I', err)
+	}
+	affected, _ := res.RowsAffected()
+	return writeMessages(c,
+		&pgproto3.CommandComplete{CommandTag: commandTag(query, affected, 0)},
+		&pgproto3.ReadyForQuery{TxStatus: 'I'},
+	)
+}
+
+// streamSimpleQuery runs a result-returning statement and streams its rows.
+func (s *Server) streamSimpleQuery(ctx context.Context, c *Conn, query string) error {
+	rows, err := c.db.QueryContext(ctx, query)
+	if err != nil {
+		return writeErrorReady(c, 'I', err)
+	}
 	defer rows.Close()
 
-	// Encode column header.
 	cols, err := rows.ColumnTypes()
 	if err != nil {
-		return fmt.Errorf("column types: %w", err)
+		return writeErrorReady(c, 'I', err)
 	}
-	buf := toRowDescription(cols).Encode(nil)
 
-	// Iterate over each row and encode it to the wire protocol.
+	var buf []byte
+	if len(cols) > 0 {
+		buf = toRowDescription(cols).Encode(buf)
+	}
+
+	var n int64
 	for rows.Next() {
 		row, err := scanRow(rows, cols)
 		if err != nil {
-			return fmt.Errorf("scan: %w", err)
+			return writeErrorReady(c, 'I', err)
 		}
 		buf = row.Encode(buf)
+		n++
 	}
 	if err := rows.Err(); err != nil {
-		return fmt.Errorf("rows: %w", err)
+		return writeErrorReady(c, 'I', err)
 	}
 
-	// Mark command complete and ready for next query.
-	buf = (&pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")}).Encode(buf)
+	buf = (&pgproto3.CommandComplete{CommandTag: commandTag(query, 0, n)}).Encode(buf)
 	buf = (&pgproto3.ReadyForQuery{TxStatus: 'I'}).Encode(buf)
-
 	_, err = c.Write(buf)
 	return err
 }
@@ -401,111 +502,270 @@ func scanRow(rows *sql.Rows, cols []*sql.ColumnType) (*pgproto3.DataRow, error) 
 	return &row, nil
 }
 
-func (s *Server) handleParseMessage(ctx context.Context, c *Conn, pmsg *pgproto3.Parse) error {
-	// Rewrite system-information queries so they're tolerable by SQLite.
-	query := rewriteQuery(pmsg.Query)
+// failExtended reports a query-level error during the extended protocol. It sends
+// an ErrorResponse and arranges for subsequent messages to be discarded until the
+// client's next Sync (per the Postgres protocol); the connection stays open.
+func (s *Server) failExtended(c *Conn, err error) error {
+	c.skipUntilSync = true
+	return writeError(c, err)
+}
 
-	if pmsg.Query != query {
+// handleParseMessage prepares a statement and stores it under the given name
+// ("" is the unnamed statement). It responds with ParseComplete.
+func (s *Server) handleParseMessage(ctx context.Context, c *Conn, msg *pgproto3.Parse) error {
+	query := rewriteQuery(msg.Query)
+	if msg.Query != query {
 		log.Printf("query rewrite: %s", query)
 	}
 
-	// Prepare the query.
 	stmt, err := c.db.PrepareContext(ctx, query)
 	if err != nil {
-		return fmt.Errorf("prepare: %w", err)
+		return s.failExtended(c, fmt.Errorf("prepare: %w", err))
 	}
 
-	var rows *sql.Rows
-	var cols []*sql.ColumnType
-	var binds []interface{}
-	exec := func() (err error) {
-		if rows != nil {
-			return nil
-		}
-		if rows, err = stmt.QueryContext(ctx, binds...); err != nil {
-			return fmt.Errorf("query: %w", err)
-		}
-		if cols, err = rows.ColumnTypes(); err != nil {
-			return fmt.Errorf("column types: %w", err)
-		}
-		return nil
+	if old, ok := c.stmts[msg.Name]; ok && old.stmt != nil {
+		old.stmt.Close()
+	}
+	c.stmts[msg.Name] = &preparedStatement{
+		name:    msg.Name,
+		query:   query,
+		stmt:    stmt,
+		nparams: countParams(query),
+	}
+	return writeMessages(c, &pgproto3.ParseComplete{})
+}
+
+// handleBindMessage binds parameter values to a prepared statement, producing a
+// portal. It responds with BindComplete.
+func (s *Server) handleBindMessage(ctx context.Context, c *Conn, msg *pgproto3.Bind) error {
+	ps, ok := c.stmts[msg.PreparedStatement]
+	if !ok {
+		return s.failExtended(c, fmt.Errorf("prepared statement %q does not exist", msg.PreparedStatement))
 	}
 
-	// LOOP:
-	for {
-		msg, err := c.backend.Receive()
-		if err != nil {
-			return fmt.Errorf("receive message during parse: %w", err)
+	// Parameters arrive as text (we advertise parameter type OID 0, so clients do
+	// not binary-encode them). A nil value represents SQL NULL.
+	params := make([]interface{}, len(msg.Parameters))
+	for i, p := range msg.Parameters {
+		if p != nil {
+			params[i] = string(p)
 		}
+	}
 
-		log.Printf("[recv(p)] %#v", msg)
+	if old, ok := c.portals[msg.DestinationPortal]; ok {
+		old.close()
+	}
+	c.portals[msg.DestinationPortal] = &boundPortal{name: msg.DestinationPortal, ps: ps, params: params}
+	return writeMessages(c, &pgproto3.BindComplete{})
+}
 
-		switch msg := msg.(type) {
-		case *pgproto3.Bind:
-			binds = make([]interface{}, len(msg.Parameters))
-			for i := range msg.Parameters {
-				binds[i] = string(msg.Parameters[i])
-			}
-
-		case *pgproto3.Describe:
-			if err := exec(); err != nil {
-				return fmt.Errorf("exec: %w", err)
-			}
-			if _, err := c.Write(toRowDescription(cols).Encode(nil)); err != nil {
-				return err
-			}
-
-		case *pgproto3.Execute:
-			// TODO: Send pgproto3.ParseComplete?
-			if err := exec(); err != nil {
-				return fmt.Errorf("exec: %w", err)
-			}
-
-			var buf []byte
-			for rows.Next() {
-				row, err := scanRow(rows, cols)
-				if err != nil {
-					return fmt.Errorf("scan: %w", err)
-				}
-				buf = row.Encode(buf)
-			}
-			if err := rows.Err(); err != nil {
-				return fmt.Errorf("rows: %w", err)
-			}
-
-			// Mark command complete and ready for next query.
-			buf = (&pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")}).Encode(buf)
-			buf = (&pgproto3.ReadyForQuery{TxStatus: 'I'}).Encode(buf)
-			_, err := c.Write(buf)
-			return err
-
-		default:
-			return fmt.Errorf("unexpected message type during parse: %#v", msg)
+// handleDescribeMessage describes a prepared statement ('S') or portal ('P'),
+// reporting the parameters and/or result columns the client should expect.
+func (s *Server) handleDescribeMessage(ctx context.Context, c *Conn, msg *pgproto3.Describe) error {
+	switch msg.ObjectType {
+	case 'S':
+		ps, ok := c.stmts[msg.Name]
+		if !ok {
+			return s.failExtended(c, fmt.Errorf("prepared statement %q does not exist", msg.Name))
 		}
+		return s.describeStatement(ctx, c, ps)
+	case 'P':
+		p, ok := c.portals[msg.Name]
+		if !ok {
+			return s.failExtended(c, fmt.Errorf("portal %q does not exist", msg.Name))
+		}
+		if err := p.execute(ctx); err != nil {
+			return s.failExtended(c, err)
+		}
+		return writeMessages(c, rowDescriptionOrNoData(p.cols))
+	default:
+		return s.failExtended(c, fmt.Errorf("invalid Describe object type %q", msg.ObjectType))
 	}
 }
 
-func (s *Server) execSetQuery(ctx context.Context, c *Conn, query string) error {
-	buf := (&pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")}).Encode(nil)
-	buf = (&pgproto3.ReadyForQuery{TxStatus: 'I'}).Encode(buf)
+// describeStatement reports a prepared statement's parameters and result columns
+// WITHOUT executing it (no side effects): it binds NULLs and reads the column
+// metadata without ever stepping the statement.
+func (s *Server) describeStatement(ctx context.Context, c *Conn, ps *preparedStatement) error {
+	nullArgs := make([]interface{}, ps.nparams)
+	rows, err := ps.stmt.QueryContext(ctx, nullArgs...)
+	if err != nil {
+		return s.failExtended(c, err)
+	}
+	cols, err := rows.ColumnTypes()
+	rows.Close()
+	if err != nil {
+		return s.failExtended(c, err)
+	}
+
+	// Report parameter types as unspecified (OID 0); clients then send parameters
+	// as text, which is all this server consumes.
+	oids := make([]uint32, ps.nparams)
+	return writeMessages(c, &pgproto3.ParameterDescription{ParameterOIDs: oids}, rowDescriptionOrNoData(cols))
+}
+
+// handleExecuteMessage runs a bound portal and streams its rows, then reports
+// CommandComplete. RowDescription, if wanted, was sent in response to Describe.
+func (s *Server) handleExecuteMessage(ctx context.Context, c *Conn, msg *pgproto3.Execute) error {
+	p, ok := c.portals[msg.Portal]
+	if !ok {
+		return s.failExtended(c, fmt.Errorf("portal %q does not exist", msg.Portal))
+	}
+	if err := p.execute(ctx); err != nil {
+		return s.failExtended(c, err)
+	}
+
+	var buf []byte
+	var streamed int64
+	if p.rows != nil {
+		for p.rows.Next() {
+			row, err := scanRow(p.rows, p.cols)
+			if err != nil {
+				p.close()
+				return s.failExtended(c, err)
+			}
+			buf = row.Encode(buf)
+			streamed++
+		}
+		if err := p.rows.Err(); err != nil {
+			p.close()
+			return s.failExtended(c, err)
+		}
+		p.close()
+	}
+
+	var affected int64
+	if p.result != nil {
+		affected, _ = p.result.RowsAffected()
+	}
+	buf = (&pgproto3.CommandComplete{CommandTag: commandTag(p.ps.query, affected, streamed)}).Encode(buf)
 	_, err := c.Write(buf)
 	return err
+}
+
+// handleCloseMessage closes a prepared statement or portal and responds with
+// CloseComplete.
+func (s *Server) handleCloseMessage(ctx context.Context, c *Conn, msg *pgproto3.Close) error {
+	switch msg.ObjectType {
+	case 'S':
+		if ps, ok := c.stmts[msg.Name]; ok {
+			if ps.stmt != nil {
+				ps.stmt.Close()
+			}
+			delete(c.stmts, msg.Name)
+		}
+	case 'P':
+		if p, ok := c.portals[msg.Name]; ok {
+			p.close()
+			delete(c.portals, msg.Name)
+		}
+	}
+	return writeMessages(c, &pgproto3.CloseComplete{})
+}
+
+// rowDescriptionOrNoData returns a RowDescription when the statement produces
+// columns, otherwise NoData.
+func rowDescriptionOrNoData(cols []*sql.ColumnType) pgproto3.Message {
+	if len(cols) == 0 {
+		return &pgproto3.NoData{}
+	}
+	return toRowDescription(cols)
 }
 
 type Conn struct {
 	net.Conn
 	backend *pgproto3.Backend
 	db      *sql.DB // sqlite database
+
+	// Extended-protocol session state.
+	stmts         map[string]*preparedStatement // by name ("" = unnamed)
+	portals       map[string]*boundPortal       // by name ("" = unnamed)
+	skipUntilSync bool                          // discarding messages after an error
+}
+
+// preparedStatement is a parsed (and rewritten) statement created by Parse.
+type preparedStatement struct {
+	name    string
+	query   string
+	stmt    *sql.Stmt
+	nparams int
+}
+
+// boundPortal is a prepared statement with bound parameter values, created by
+// Bind. It is executed at most once; Describe and Execute share that single
+// execution so statements with side effects (e.g. INSERT) run exactly once.
+type boundPortal struct {
+	name   string
+	ps     *preparedStatement
+	params []interface{}
+
+	executed bool
+	rows     *sql.Rows
+	cols     []*sql.ColumnType
+	result   sql.Result
+	execErr  error
+}
+
+// execute runs the portal's statement once. Result-returning statements are run
+// with Query (rows are not stepped here, so side effects are deferred to Execute);
+// non-row statements are run with Exec so the affected-row count is available.
+func (p *boundPortal) execute(ctx context.Context) error {
+	if p.executed {
+		return p.execErr
+	}
+	p.executed = true
+
+	if !isRowReturning(p.ps.query) {
+		res, err := p.ps.stmt.ExecContext(ctx, p.params...)
+		if err != nil {
+			p.execErr = err
+			return err
+		}
+		p.result = res
+		return nil
+	}
+
+	rows, err := p.ps.stmt.QueryContext(ctx, p.params...)
+	if err != nil {
+		p.execErr = err
+		return err
+	}
+	cols, err := rows.ColumnTypes()
+	if err != nil {
+		rows.Close()
+		p.execErr = err
+		return err
+	}
+	p.rows, p.cols = rows, cols
+	return nil
+}
+
+func (p *boundPortal) close() {
+	if p.rows != nil {
+		p.rows.Close()
+		p.rows = nil
+	}
 }
 
 func newConn(conn net.Conn) *Conn {
 	return &Conn{
 		Conn:    conn,
 		backend: pgproto3.NewBackend(pgproto3.NewChunkReader(conn), conn),
+		stmts:   make(map[string]*preparedStatement),
+		portals: make(map[string]*boundPortal),
 	}
 }
 
 func (c *Conn) Close() (err error) {
+	for _, p := range c.portals {
+		p.close()
+	}
+	for _, ps := range c.stmts {
+		if ps.stmt != nil {
+			ps.stmt.Close()
+		}
+	}
+
 	if c.db != nil {
 		if e := c.db.Close(); err == nil {
 			err = e
