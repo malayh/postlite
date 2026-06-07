@@ -49,17 +49,13 @@ func introspectColumns(t *testing.T, conn *pgx.Conn, table string) []columnMeta 
 	return cols
 }
 
-// TestE2E_NocoDBRelationList runs NocoDB's exact foreign-key introspection query,
-// which uses PostgreSQL-only "LEFT JOIN LATERAL UNNEST(...) WITH ORDINALITY".
-// postlite recognizes the shape and answers it from pragma_foreign_key_list, so
-// the seed FK products.owner_id -> users.id comes back with the columns NocoDB
-// reads (tn, cn, rtn, rcn, ur, dr).
-func TestE2E_NocoDBRelationList(t *testing.T) {
-	_, addr := newTestServer(t, seedSchema)
-	conn := pgxConnect(t, addr, "test.db")
-	ctx := context.Background()
-
-	const q = `SELECT
+// nocoRelationListQuery and nocoColumnListQuery are the real PostgreSQL-catalog
+// introspection shapes node-postgres/Knex (NocoDB) emit. They are NOT special-cased
+// by postlite — they run through the general rewriter (UNNEST -> json_each over the
+// JSON-array conkey/confkey columns, '...'::regclass -> oid/name lookups, CONCAT ->
+// ||, string_agg -> group_concat) against the catalog. Any Postgres client emitting
+// these constructs is served the same way.
+const nocoRelationListQuery = `SELECT
           sch.nspname    AS ts,
           pc.conname     AS cstn,
           tbl.relname    AS tn,
@@ -81,7 +77,48 @@ func TestE2E_NocoDBRelationList(t *testing.T) {
         WHERE pc.contype = 'f' AND sch.nspname = $1 AND f_sch.nspname = sch.nspname
         ORDER BY tn`
 
-	rows, err := conn.Query(ctx, q, "public")
+// Result columns: tn(0) cn(1) dt(2) ck(3) au(4) ge(5) csn(6) enum_values(7).
+const nocoColumnListQuery = `SELECT
+          c.table_name AS tn,
+          c.column_name AS cn,
+          c.data_type AS dt,
+          pk.constraint_type AS ck,
+          (CASE WHEN trg.trigger_name IS NULL THEN false ELSE true END) AS au,
+          c.generation_expression AS ge,
+          c.character_set_name AS csn,
+          (SELECT string_agg(enumlabel, ',') FROM pg_enum e
+             INNER JOIN pg_type t ON t.oid = e.enumtypid
+             INNER JOIN pg_namespace n ON n.oid = t.typnamespace
+             WHERE n.nspname = c.udt_schema AND t.typname = c.udt_name) AS enum_values
+        FROM information_schema.columns c
+        LEFT JOIN (
+          SELECT pc.conrelid::regclass::text AS table_name,
+                 col.attname AS column_name,
+                 pc.contype AS constraint_type
+          FROM pg_constraint pc
+          JOIN pg_namespace n ON n.oid = pc.connamespace
+          INNER JOIN pg_catalog.pg_class rel ON rel.oid = pc.conrelid
+          LEFT JOIN LATERAL UNNEST(pc.conkey) WITH ORDINALITY AS u(attnum, attposition) ON TRUE
+          LEFT JOIN pg_attribute col ON (col.attrelid = pc.conrelid AND col.attnum = u.attnum)
+          WHERE pc.contype = 'p'
+        ) pk ON pk.table_name = c.table_name AND pk.column_name = c.column_name
+        LEFT JOIN information_schema.triggers trg
+          ON trg.event_object_table = c.table_name
+          AND trg.trigger_name = CONCAT('xc_trigger_', 'scans', '_', c.column_name)
+        WHERE c.table_catalog = $1 AND c.table_schema = $2 AND c.table_name = $3
+        ORDER BY c.ordinal_position`
+
+// TestE2E_NocoDBRelationList runs NocoDB's foreign-key introspection query, which
+// uses PostgreSQL-only "LEFT JOIN LATERAL UNNEST(...) WITH ORDINALITY" over the
+// pg_constraint conkey/confkey arrays. The general rewriter turns it into json_each,
+// so the seed FK products.owner_id -> users.id comes back with the columns the
+// client reads (tn, cn, rtn, rcn, ur, dr).
+func TestE2E_NocoDBRelationList(t *testing.T) {
+	_, addr := newTestServer(t, seedSchema)
+	conn := pgxConnect(t, addr, "test.db")
+	ctx := context.Background()
+
+	rows, err := conn.Query(ctx, nocoRelationListQuery, "public")
 	if err != nil {
 		t.Fatalf("relationList query: %v", err)
 	}
@@ -110,25 +147,18 @@ func TestE2E_NocoDBRelationList(t *testing.T) {
 	}
 }
 
-// TestE2E_NocoDBColumnList drives NocoDB's columnList shape (detected by the
-// pk_constraint_name1 alias) with its eight bind parameters. postlite swaps the
-// whole statement for its information_schema_columns equivalent; this verifies the
-// replacement executes over the extended protocol and reports the products columns
-// with the primary key (id) flagged via ck = 'p'.
+// TestE2E_NocoDBColumnList runs NocoDB's columnList shape — information_schema.
+// columns joined to a primary-key sub-select that uses LATERAL UNNEST over
+// pg_constraint.conkey, '...'::regclass, a CONCAT-built trigger-name match, and a
+// string_agg enum look-up. None of it is special-cased; the general rewriter handles
+// every construct. It must report the products columns in ordinal order with the
+// primary key (id) flagged via ck = 'p'.
 func TestE2E_NocoDBColumnList(t *testing.T) {
 	_, addr := newTestServer(t, seedSchema)
 	conn := pgxConnect(t, addr, "test.db")
 	ctx := context.Background()
 
-	const q = `select c.table_name as tn, pk1.constraint_name as pk_constraint_name1
-		from information_schema.columns c
-		where c.table_catalog=$1 and c.table_schema=$2 and c.table_name=$3
-		  and $4=$4 and $5=$5 and $6=$6 and $7=$7 and $8=$8`
-
-	// Args map to the rewritten query's $1..$8; only $7 (schema) and $8 (table)
-	// filter. Pass NocoDB's real semantics: catalog, schema, schema, table, table,
-	// catalog, schema, table.
-	rows, err := conn.Query(ctx, q, "test.db", "public", "public", "products", "products", "test.db", "public", "products")
+	rows, err := conn.Query(ctx, nocoColumnListQuery, "test.db", "public", "products")
 	if err != nil {
 		t.Fatalf("columnList query: %v", err)
 	}
@@ -141,10 +171,10 @@ func TestE2E_NocoDBColumnList(t *testing.T) {
 		if err != nil {
 			t.Fatalf("values: %v", err)
 		}
-		// Column order is fixed by columnListQuery: tn=0, cn=1, ..., ck=4.
+		// Column order: tn=0, cn=1, dt=2, ck=3, ...
 		cn, _ := v[1].(string)
 		order = append(order, cn)
-		ckByCol[cn] = v[4]
+		ckByCol[cn] = v[3]
 	}
 	if err := rows.Err(); err != nil {
 		t.Fatalf("rows: %v", err)

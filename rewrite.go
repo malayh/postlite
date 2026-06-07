@@ -16,32 +16,6 @@ import (
 func rewrite(q string) string {
 	trimmed := strings.TrimSpace(q)
 
-	// psql pulls the keyword list with a catalog function we do not implement;
-	// hand back an empty result set instead of erroring.
-	if strings.Contains(q, `select string_agg(word, ',') from pg_catalog.pg_get_keywords()`) {
-		return `SELECT '' AS "string_agg" WHERE 1 = 2`
-	}
-
-	// NocoDB's columnList is a large per-table column-metadata query whose PK
-	// sub-select uses "LATERAL UNNEST(pc.conkey) WITH ORDINALITY" (no SQLite
-	// equivalent) and takes eight bind parameters. Recognize it (the pk_constraint_
-	// name1 alias is unique to it) and answer it from information_schema_columns plus
-	// pragma-derived primary-key / unique-column joins, keeping all eight $-params.
-	if strings.Contains(q, "pk_constraint_name1") {
-		return strings.ReplaceAll(columnListQuery, notVirtualToken, notVirtualPredicate)
-	}
-
-	// NocoDB's relationList enumerates foreign keys with a PostgreSQL-specific
-	// "LEFT JOIN LATERAL UNNEST(pc.conkey/confkey) WITH ORDINALITY" join that SQLite
-	// cannot parse. It is distinguished from columnList by unnesting confkey (the
-	// referenced-column side) too. Answer it from pragma_foreign_key_list, which
-	// already yields one row per foreign-key column (its seq column is the composite-
-	// key position the WITH ORDINALITY join reconstructs), producing the same result
-	// columns (ts, cstn, tn, cn, foreign_table_schema, rtn, rcn, ur, dr).
-	if strings.Contains(q, "UNNEST(pc.confkey)") {
-		return strings.ReplaceAll(fkRelationListQuery, notVirtualToken, notVirtualPredicate)
-	}
-
 	// SET / RESET configure session GUCs that PostgreSQL tracks but SQLite has no
 	// notion of. Accept and ignore them so session setup does not fail.
 	switch leadingKeyword(trimmed) {
@@ -51,8 +25,7 @@ func rewrite(q string) string {
 
 	// CREATE/DROP DATABASE have no SQLite equivalent. A postlite "database" is just a
 	// SQLite file (the single mounted file, or one created on first connect), so it
-	// effectively always exists; accept these as no-ops rather than erroring. NocoDB
-	// issues CREATE DATABASE from createDatabaseIfNotExists when adding a source.
+	// effectively always exists; accept these as no-ops rather than erroring.
 	if m := databaseDDLRegex.FindStringSubmatch(trimmed); m != nil {
 		return "SELECT '" + strings.ToUpper(m[1]) + " DATABASE'"
 	}
@@ -68,6 +41,25 @@ func rewrite(q string) string {
 	q = anyArrayRegex.ReplaceAllString(q, "IN ($1)")
 	q = anyBraceRegex.ReplaceAllStringFunc(q, rewriteAnyBrace)
 
+	// PostgreSQL functions/constructs with no identical SQLite spelling. These are
+	// general translations (not tied to any one client): they let real introspection
+	// queries — node-postgres/Knex, pgx, psql, DBeaver — run against the catalog as
+	// written, instead of being recognized and swapped out wholesale.
+	//
+	//   string_agg(x, d)  -> group_concat(x, d)            (same aggregate)
+	//   CONCAT(a, b, ...) -> (COALESCE(a,'') || ...)        (NULL-as-empty semantics)
+	//   UNNEST(arr) [WITH ORDINALITY] AS t(v[, ord])
+	//                     -> json_each(COALESCE(arr,'[]')) t (see rewriteUnnest)
+	q = stringAggRegex.ReplaceAllString(q, "group_concat(")
+	q = rewriteConcat(q)
+	q = rewriteUnnest(q)
+
+	// "<oid>::regclass[::text]" -> the relation's name; "'name'::regclass" -> its oid.
+	// This must run before the generic cast strip below, which would otherwise drop
+	// "::regclass" and leave a bare oid where a relation name is expected.
+	q = regclassOidRegex.ReplaceAllString(q, "(SELECT oid FROM pg_class WHERE relname = '$1')")
+	q = regclassNameRegex.ReplaceAllString(q, "(SELECT relname FROM pg_class WHERE oid = $1)")
+
 	// Strip the pg_catalog. schema qualifier: the catalog objects (attached
 	// virtual tables and temp views) and the registered catalog functions are all
 	// reachable unqualified.
@@ -78,8 +70,12 @@ func rewrite(q string) string {
 	// still reference the user's tables).
 	q = informationSchemaRegex.ReplaceAllString(q, "information_schema_")
 
-	// Remove ::type casts; SQLite has no :: cast syntax. The underlying value is
-	// already the right shape for our text-format results.
+	// pg_get_keywords() is a no-argument set-returning function in PostgreSQL; postlite
+	// exposes the keyword list as a view, so drop the call parentheses.
+	q = keywordsCallRegex.ReplaceAllString(q, "pg_get_keywords")
+
+	// Remove remaining ::type casts; SQLite has no :: cast syntax. The underlying value
+	// is already the right shape for our text-format results.
 	q = castRegex.ReplaceAllString(q, "")
 
 	// Turn bare system-information identifiers (current_schema, current_user, ...)
@@ -88,7 +84,7 @@ func rewrite(q string) string {
 
 	// "SHOW name" -> "SELECT show('name') AS "name"". The alias matters: PostgreSQL
 	// names the result column after the setting, and strict clients read it by that
-	// name (NocoDB's PgClient runs "SHOW server_version" and reads row.server_version).
+	// name (e.g. node-postgres runs "SHOW server_version" and reads row.server_version).
 	q = showRegex.ReplaceAllStringFunc(q, func(m string) string {
 		name := strings.ToLower(showRegex.FindStringSubmatch(m)[1])
 		return `SELECT show('` + name + `') AS "` + name + `"`
@@ -143,89 +139,151 @@ var (
 
 	// = ANY('{ ... }'[::type]).
 	anyBraceRegex = regexp.MustCompile(`(?i)=\s*ANY\s*\(\s*'\{([^}]*)\}'\s*(?:::\s*[\w".\[\] ]+)?\)`)
+
+	// string_agg( -> group_concat( (the call's leading token only; args are unchanged).
+	stringAggRegex = regexp.MustCompile(`(?i)\bstring_agg\s*\(`)
+
+	// CONCAT( — start of a PostgreSQL CONCAT() call (rewriteConcat finds its matching
+	// close paren). The negative-lookbehind-free \b avoids matching concat_ws.
+	concatRegex = regexp.MustCompile(`(?i)\bconcat\s*\(`)
+
+	// UNNEST(arr) [WITH ORDINALITY] [AS] alias(valcol[, ordcol]) — a lateral array
+	// expansion. Groups: 1=array expr, 2=alias, 3=value column, 4=ordinality column.
+	unnestRegex = regexp.MustCompile(`(?is)(?:LATERAL\s+)?UNNEST\s*\(\s*([^()]*?)\s*\)\s*(?:WITH\s+ORDINALITY\s+)?(?:AS\s+)?(\w+)\s*\(\s*(\w+)\s*(?:,\s*(\w+)\s*)?\)`)
+
+	// 'name'::regclass -> the relation's oid.
+	regclassOidRegex = regexp.MustCompile(`(?i)'([^']*)'\s*::\s*regclass\b`)
+	// <ident>::regclass[::text|::varchar|::name] -> the relation's name.
+	regclassNameRegex = regexp.MustCompile(`(?i)\b(\w+(?:\.\w+)?)\s*::\s*regclass(?:\s*::\s*(?:text|varchar|name))?`)
+
+	// pg_get_keywords() call parentheses (postlite exposes it as a view).
+	keywordsCallRegex = regexp.MustCompile(`(?i)\bpg_get_keywords\s*\(\s*\)`)
 )
 
-// fkRelationListQuery is the SQLite equivalent of NocoDB's relationList
-// foreign-key query (see rewrite). It keeps a single $1 placeholder for the schema
-// filter so the bound-parameter count still matches, and maps SQLite's on_update /
-// on_delete action text onto PostgreSQL's single-character confupdtype/confdeltype
-// codes. postlite reports every object in the "public" schema (relnamespace 2200).
-const fkRelationListQuery = `SELECT
-	'public' AS ts,
-	m.name || '_' || fk.id || '_fkey' AS cstn,
-	m.name AS tn,
-	fk."from" AS cn,
-	'public' AS foreign_table_schema,
-	fk."table" AS rtn,
-	fk."to" AS rcn,
-	CASE fk.on_update WHEN 'CASCADE' THEN 'c' WHEN 'SET NULL' THEN 'n' WHEN 'SET DEFAULT' THEN 'd' WHEN 'RESTRICT' THEN 'r' ELSE 'a' END AS ur,
-	CASE fk.on_delete WHEN 'CASCADE' THEN 'c' WHEN 'SET NULL' THEN 'n' WHEN 'SET DEFAULT' THEN 'd' WHEN 'RESTRICT' THEN 'r' ELSE 'a' END AS dr
-FROM main.sqlite_master m
-JOIN pragma_foreign_key_list(m.name) fk
-WHERE m.type = 'table' AND m.name NOT LIKE 'sqlite_%'
-	$$NOTVT$$
-	AND 'public' = $1
-ORDER BY tn`
+// rewriteConcat rewrites PostgreSQL CONCAT(a, b, ...) into the SQLite expression
+// (COALESCE(a,”) || COALESCE(b,”) || ...). PostgreSQL's CONCAT treats NULL as the
+// empty string, which the COALESCE wrappers reproduce (bare || would yield NULL).
+// Nested CONCAT calls are handled by repeated passes; quoted strings are respected.
+func rewriteConcat(q string) string {
+	for {
+		loc := concatRegex.FindStringIndex(q)
+		if loc == nil {
+			return q
+		}
+		open := loc[1] - 1 // index of '('
+		end := matchParen(q, open)
+		if end < 0 {
+			return q // unbalanced parentheses; leave untouched
+		}
+		args := splitArgs(q[open+1 : end])
+		var b strings.Builder
+		b.WriteString("(")
+		for i, a := range args {
+			if i > 0 {
+				b.WriteString(" || ")
+			}
+			b.WriteString("COALESCE(")
+			b.WriteString(strings.TrimSpace(a))
+			b.WriteString(",'')")
+		}
+		b.WriteString(")")
+		q = q[:loc[0]] + b.String() + q[end+1:]
+	}
+}
 
-// columnListQuery is the SQLite equivalent of NocoDB's relationList-free
-// columnList query (see rewrite). It returns the same result columns NocoDB reads
-// per column (tn, cn, dt, au, ck, clen, np, ns, dp, cop, nrqd, cdf,
-// generation_expression, character_octet_length, csn, pk_ordinal_position,
-// pk_constraint_name, pk_ordinal_position1, pk_constraint_name1, udt_name,
-// udt_schema, ii, is_unique, enum_values, udt_typtype), drawing columns from
-// information_schema_columns and primary-key / unique membership from pragma joins.
-// It keeps all eight $-placeholders, referenced in order so SQLite's positional
-// bind maps the eight values correctly; only the schema ($7) and table ($8) filter,
-// the rest are NULL-safe no-ops. postlite has no NocoDB autoincrement triggers,
-// enums, generated columns or character sets, so au/enum_values/generation_
-// expression/csn are NULL and udt_typtype is the base-type marker 'b'.
-const columnListQuery = `SELECT
-	c.table_name AS tn,
-	c.column_name AS cn,
-	c.data_type AS dt,
-	NULL AS au,
-	pk.constraint_type AS ck,
-	c.character_maximum_length AS clen,
-	c.numeric_precision AS np,
-	c.numeric_scale AS ns,
-	c.datetime_precision AS dp,
-	c.ordinal_position AS cop,
-	c.is_nullable AS nrqd,
-	c.column_default AS cdf,
-	NULL AS generation_expression,
-	c.character_octet_length AS character_octet_length,
-	NULL AS csn,
-	pk.ordinal_position AS pk_ordinal_position,
-	pk.constraint_name AS pk_constraint_name,
-	pk.ordinal_position AS pk_ordinal_position1,
-	pk.constraint_name AS pk_constraint_name1,
-	c.udt_name AS udt_name,
-	c.udt_schema AS udt_schema,
-	c.is_identity AS ii,
-	CASE WHEN uq.column_name IS NOT NULL THEN 1 ELSE NULL END AS is_unique,
-	NULL AS enum_values,
-	'b' AS udt_typtype
-FROM information_schema_columns c
-LEFT JOIN (
-	SELECT m.name AS table_name, ti.name AS column_name,
-	       'p' AS constraint_type, ti.pk AS ordinal_position,
-	       m.name || '_pkey' AS constraint_name
-	FROM main.sqlite_master m
-	JOIN pragma_table_info(m.name) ti
-	WHERE m.type = 'table' $$NOTVT$$ AND ti.pk > 0
-) pk ON pk.table_name = c.table_name AND pk.column_name = c.column_name
-LEFT JOIN (
-	SELECT m.name AS table_name, ii2.name AS column_name
-	FROM main.sqlite_master m
-	JOIN pragma_index_list(m.name) il
-	JOIN pragma_index_info(il.name) ii2
-	WHERE m.type = 'table' $$NOTVT$$ AND il."unique" = 1 AND il.origin <> 'pk'
-	      AND (SELECT count(*) FROM pragma_index_info(il.name)) = 1
-	GROUP BY m.name, ii2.name
-) uq ON uq.table_name = c.table_name AND uq.column_name = c.column_name
-WHERE $1 IS $1 AND $2 IS $2 AND $3 IS $3 AND $4 IS $4 AND $5 IS $5 AND $6 IS $6
-      AND c.table_schema = $7 AND c.table_name = $8
-ORDER BY c.table_name, c.ordinal_position`
+// rewriteUnnest converts PostgreSQL "UNNEST(arr) [WITH ORDINALITY] [AS] t(v[, ord])"
+// into SQLite "json_each(COALESCE(arr,'[]')) t", then rewrites the alias's columns:
+// the value column becomes t.value and the ordinality column becomes (t.key + 1)
+// (json_each's key is 0-based). Array-valued catalog columns (e.g. pg_constraint.
+// conkey/confkey) are stored as JSON arrays so json_each expands them; UNNEST(NULL)
+// yields no rows in both engines.
+func rewriteUnnest(q string) string {
+	type rename struct{ alias, valCol, ordCol string }
+	var renames []rename
+	q = unnestRegex.ReplaceAllStringFunc(q, func(match string) string {
+		m := unnestRegex.FindStringSubmatch(match)
+		expr, alias, valCol, ordCol := m[1], m[2], m[3], m[4]
+		renames = append(renames, rename{alias, valCol, ordCol})
+		return "json_each(COALESCE(" + expr + ",'[]')) " + alias
+	})
+	for _, r := range renames {
+		q = aliasColRegex(r.alias, r.valCol).ReplaceAllString(q, r.alias+".value")
+		if r.ordCol != "" {
+			q = aliasColRegex(r.alias, r.ordCol).ReplaceAllString(q, "("+r.alias+".key + 1)")
+		}
+	}
+	return q
+}
+
+// aliasColRegex matches a qualified column reference "<alias>.<col>" on word
+// boundaries so an alias is not matched inside a longer identifier.
+func aliasColRegex(alias, col string) *regexp.Regexp {
+	return regexp.MustCompile(`\b` + regexp.QuoteMeta(alias) + `\.` + regexp.QuoteMeta(col) + `\b`)
+}
+
+// matchParen returns the index of the ')' that matches the '(' at index open, or -1
+// if unbalanced. Parentheses inside single-quoted string literals are ignored.
+func matchParen(s string, open int) int {
+	depth, inStr := 0, false
+	for i := open; i < len(s); i++ {
+		c := s[i]
+		if inStr {
+			if c == '\'' {
+				if i+1 < len(s) && s[i+1] == '\'' { // doubled '' escape
+					i++
+					continue
+				}
+				inStr = false
+			}
+			continue
+		}
+		switch c {
+		case '\'':
+			inStr = true
+		case '(':
+			depth++
+		case ')':
+			if depth--; depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+// splitArgs splits a function argument list on top-level commas, respecting nested
+// parentheses and single-quoted string literals.
+func splitArgs(s string) []string {
+	var args []string
+	depth, inStr, start := 0, false, 0
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if inStr {
+			if c == '\'' {
+				if i+1 < len(s) && s[i+1] == '\'' {
+					i++
+					continue
+				}
+				inStr = false
+			}
+			continue
+		}
+		switch c {
+		case '\'':
+			inStr = true
+		case '(':
+			depth++
+		case ')':
+			depth--
+		case ',':
+			if depth == 0 {
+				args = append(args, s[start:i])
+				start = i + 1
+			}
+		}
+	}
+	return append(args, s[start:])
+}
 
 // unwrapOperator turns a matched OPERATOR(pg_catalog.<op>) into a SQLite operator.
 // Pattern-matching operators map onto LIKE/REGEXP; anything else collapses to the

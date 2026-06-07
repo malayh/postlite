@@ -86,30 +86,33 @@ func TestVirtualTable_ExcludedFromIntrospection(t *testing.T) {
 }
 
 // NocoDB's columnList is the query that actually crashed against a database with an
-// fts5 table. Drive its rewritten form (triggered by the pk_constraint_name1 marker)
-// with the same eight bind parameters NocoDB sends; it must succeed and report the
-// real tables' columns without ever touching the fts5 table.
+// fts5 table. Run the real query shape (nocoColumnListQuery) — which walks
+// pg_constraint / pg_attribute / information_schema.columns — against the
+// fts5-injected database. Because the catalog views exclude virtual + shadow tables,
+// the query never touches the fts5 table; it must succeed and report the real
+// products columns with the primary key flagged.
 func TestVirtualTable_ColumnListSucceeds(t *testing.T) {
 	addr := newServerWithFTS5(t)
 	c := dial(t, addr, "test.db")
 
-	// Minimal query carrying the columnList marker so rewrite() swaps in the SQLite
-	// equivalent; the eight params mirror NocoDB (only $7=schema, $8=table filter).
-	const columnList = `select c.table_name as tn, pk1.constraint_name as pk_constraint_name1
-		from information_schema.columns c
-		where c.table_catalog=$6 and c.table_schema=$7 and c.table_name=$8`
-
-	r := c.extendedQuery(columnList, "test.db", "public", "public", "public", "public", "test.db", "public", "products")
+	r := c.extendedQuery(nocoColumnListQuery, "test.db", "public", "products")
 	if r.err != nil {
 		t.Fatalf("columnList: unexpected error: %s", r.err.Message)
 	}
 	if len(r.rows) == 0 {
 		t.Fatalf("columnList returned no columns for products")
 	}
+	var pkSeen bool
 	for _, row := range r.rows {
-		if row[0] != "products" {
+		if row[0] != "products" { // tn
 			t.Errorf("columnList returned a row for %q, want only products", row[0])
 		}
+		if row[1] == "id" && row[3] == "p" { // cn == id, ck == 'p'
+			pkSeen = true
+		}
+	}
+	if !pkSeen {
+		t.Errorf("columnList did not flag products.id as the primary key: %v", r.rows)
 	}
 }
 
@@ -119,11 +122,7 @@ func TestVirtualTable_RelationListSucceeds(t *testing.T) {
 	addr := newServerWithFTS5(t)
 	c := dial(t, addr, "test.db")
 
-	// Carry the confkey UNNEST marker that triggers the relationList rewrite.
-	const relationList = `SELECT pc.conname, UNNEST(pc.conkey), UNNEST(pc.confkey)
-		FROM pg_constraint pc WHERE pc.contype = 'f' AND sch.nspname = $1`
-
-	r := c.extendedQuery(relationList, "public")
+	r := c.extendedQuery(nocoRelationListQuery, "public")
 	if r.err != nil {
 		t.Fatalf("relationList: unexpected error: %s", r.err.Message)
 	}

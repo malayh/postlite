@@ -21,7 +21,8 @@ func TestRewrite(t *testing.T) {
 		{"pg_catalog-strip-upper", "SELECT * FROM PG_CATALOG.pg_class", "SELECT * FROM pg_class"},
 		{"information_schema", "SELECT * FROM information_schema.tables", "SELECT * FROM information_schema_tables"},
 		{"information_schema-upper", "SELECT * FROM INFORMATION_SCHEMA.views", "SELECT * FROM information_schema_views"},
-		{"cast-regclass", "SELECT 'users'::regclass", "SELECT 'users'"},
+		{"cast-regclass-literal", "SELECT 'users'::regclass", "SELECT (SELECT oid FROM pg_class WHERE relname = 'users')"},
+		{"cast-regclass-ident", "SELECT t.oid::regclass::text", "SELECT (SELECT relname FROM pg_class WHERE oid = t.oid)"},
 		{"cast-text", "SELECT 'x'::text", "SELECT 'x'"},
 		{"cast-oid", "SELECT relname FROM pg_class WHERE oid = '5'::oid", "SELECT relname FROM pg_class WHERE oid = '5'"},
 		{"cast-varchar-paren", "SELECT a::varchar(10) FROM t", "SELECT a FROM t"},
@@ -65,46 +66,54 @@ func TestPgColumnName(t *testing.T) {
 	}
 }
 
-// The relationList foreign-key query (LATERAL UNNEST ... WITH ORDINALITY) has no
-// SQLite equivalent token-for-token; rewrite swaps the whole statement for a
-// pragma_foreign_key_list query, keeping the single $1 schema placeholder.
-func TestRewriteFKRelationList(t *testing.T) {
-	in := `SELECT pc.conname FROM pg_constraint pc
+// UNNEST(arr) [WITH ORDINALITY] AS t(v, ord) — used by client foreign-key/column
+// introspection — has no SQLite keyword, so it is rewritten to json_each over the
+// array (stored as JSON), with the value column -> t.value and the ordinality
+// column -> (t.key + 1). The bind-parameter count is preserved (no $-params are
+// added or dropped), which the extended protocol relies on.
+func TestRewriteUnnest(t *testing.T) {
+	in := `SELECT u.attnum, f.attposition
+		FROM pg_constraint pc
 		LEFT JOIN LATERAL UNNEST(pc.conkey)  WITH ORDINALITY AS u(attnum, attposition) ON TRUE
-		LEFT JOIN LATERAL UNNEST(pc.confkey) WITH ORDINALITY AS f_u(attnum, attposition) ON TRUE
+		LEFT JOIN LATERAL UNNEST(pc.confkey) WITH ORDINALITY AS f(attnum, attposition) ON f.attposition = u.attposition
 		WHERE pc.contype = 'f' AND sch.nspname = $1`
 	got := rewrite(in)
-	if strings.Contains(got, "UNNEST") {
-		t.Errorf("UNNEST not rewritten: %q", got)
+	for _, bad := range []string{"UNNEST", "LATERAL", "ORDINALITY"} {
+		if strings.Contains(got, bad) {
+			t.Errorf("%q not rewritten: %q", bad, got)
+		}
 	}
-	if !strings.Contains(got, "pragma_foreign_key_list") {
-		t.Errorf("expected pragma_foreign_key_list, got %q", got)
+	for _, want := range []string{
+		"json_each(COALESCE(pc.conkey,'[]')) u",
+		"json_each(COALESCE(pc.confkey,'[]')) f",
+		"u.value",     // u.attnum -> u.value
+		"(u.key + 1)", // u.attposition -> (u.key + 1)
+		"(f.key + 1)", // f.attposition -> (f.key + 1), in both SELECT and ON
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("expected %q in %q", want, got)
+		}
 	}
 	if strings.Count(got, "$1") != 1 {
-		t.Errorf("rewritten query must keep exactly one $1 (bind-param count), got %q", got)
+		t.Errorf("bind-param count must be preserved (one $1), got %q", got)
 	}
 }
 
-// NocoDB's columnList query also contains UNNEST(pc.conkey) (in a PK sub-select)
-// but takes eight bind parameters. It must NOT be mistaken for relationList (one
-// param); rewrite swaps it for the information_schema_columns equivalent that keeps
-// all eight $-placeholders.
-func TestRewriteColumnList(t *testing.T) {
-	in := `select c.table_name as tn, pk1.constraint_name as pk_constraint_name1
-		from information_schema.columns c
-		LEFT JOIN LATERAL UNNEST(pc.conkey) WITH ORDINALITY AS u(attnum, attposition) ON TRUE
-		where c.table_catalog=$6 and c.table_schema=$7 and c.table_name=$8`
-	got := rewrite(in)
-	if strings.Contains(got, "UNNEST") {
-		t.Errorf("UNNEST not rewritten: %q", got)
+// string_agg/CONCAT/regclass have SQLite equivalents the rewriter substitutes so the
+// original introspection SQL runs unchanged.
+func TestRewriteFunctions(t *testing.T) {
+	cases := []struct{ name, in, want string }{
+		{"string_agg", "SELECT string_agg(word, ',') FROM t", "SELECT group_concat(word, ',') FROM t"},
+		{"concat", "SELECT CONCAT('a', b, 'c')", "SELECT (COALESCE('a','') || COALESCE(b,'') || COALESCE('c',''))"},
+		{"concat-nested", "SELECT CONCAT('x', CONCAT(a, b))", "SELECT (COALESCE('x','') || COALESCE((COALESCE(a,'') || COALESCE(b,'')),''))"},
+		{"regclass-oid", "WHERE oid = 'users'::regclass", "WHERE oid = (SELECT oid FROM pg_class WHERE relname = 'users')"},
+		{"regclass-name", "SELECT pc.conrelid::regclass::text", "SELECT (SELECT relname FROM pg_class WHERE oid = pc.conrelid)"},
+		{"keywords", "select string_agg(word, ',') from pg_catalog.pg_get_keywords()", "select group_concat(word, ',') from pg_get_keywords"},
 	}
-	for _, n := range []string{"$1", "$2", "$3", "$4", "$5", "$6", "$7", "$8"} {
-		if !strings.Contains(got, n) {
-			t.Errorf("rewritten columnList must keep %s (8 bind params), got %q", n, got)
+	for _, tc := range cases {
+		if got := rewrite(tc.in); got != tc.want {
+			t.Errorf("%s: rewrite(%q) = %q, want %q", tc.name, tc.in, got, tc.want)
 		}
-	}
-	if strings.Contains(got, "$9") {
-		t.Errorf("rewritten columnList must not introduce a 9th param: %q", got)
 	}
 }
 

@@ -47,6 +47,7 @@ const notVirtualToken = "$$NOTVT$$"
 //     SQLite (shadow marking runs through the module's xShadowName callback), so we
 //     also drop any table whose name is "<virtualtable>_<suffix>" — a virtual table
 //     is always classified "virtual" from its CREATE syntax, no module required.
+//
 // Every term references only "m", so SQLite evaluates them at the outer-table loop
 // level, before the pragma TVF is invoked for that row — the excluded table is
 // never touched.
@@ -180,7 +181,9 @@ var catalogViews = []string{
 			0 AS confrelid,
 			'' AS confupdtype,
 			'' AS confdeltype,
-			'' AS confmatchtype
+			'' AS confmatchtype,
+			(SELECT json_group_array(attnum) FROM (SELECT ti.cid + 1 AS attnum FROM pragma_table_info(m.name) ti WHERE ti.pk > 0 ORDER BY ti.pk)) AS conkey,
+			NULL AS confkey
 		FROM main.sqlite_master m
 		JOIN pragma_table_info(m.name) p ON p.pk > 0
 		WHERE m.type = 'table' $$NOTVT$$
@@ -197,7 +200,9 @@ var catalogViews = []string{
 			(SELECT rm.rowid FROM main.sqlite_master rm WHERE rm.name = fk."table") AS confrelid,
 			CASE fk.on_update WHEN 'CASCADE' THEN 'c' WHEN 'SET NULL' THEN 'n' WHEN 'SET DEFAULT' THEN 'd' WHEN 'RESTRICT' THEN 'r' ELSE 'a' END,
 			CASE fk.on_delete WHEN 'CASCADE' THEN 'c' WHEN 'SET NULL' THEN 'n' WHEN 'SET DEFAULT' THEN 'd' WHEN 'RESTRICT' THEN 'r' ELSE 'a' END,
-			'f'
+			'f',
+			(SELECT json_group_array(attnum) FROM (SELECT (SELECT t2.cid + 1 FROM pragma_table_info(m.name) t2 WHERE t2.name = fk2."from") AS attnum FROM pragma_foreign_key_list(m.name) fk2 WHERE fk2.id = fk.id ORDER BY fk2.seq)),
+			(SELECT json_group_array(attnum) FROM (SELECT (SELECT t3.cid + 1 FROM pragma_table_info(fk."table") t3 WHERE t3.name = fk2."to") AS attnum FROM pragma_foreign_key_list(m.name) fk2 WHERE fk2.id = fk.id ORDER BY fk2.seq))
 		FROM main.sqlite_master m
 		JOIN pragma_foreign_key_list(m.name) fk
 		WHERE m.type = 'table' $$NOTVT$$ AND fk.seq = 0
@@ -209,7 +214,9 @@ var catalogViews = []string{
 			m.rowid AS conrelid,
 			0,
 			m.name AS conrelname,
-			NULL, 0, '', '', ''
+			NULL, 0, '', '', '',
+			(SELECT json_group_array(attnum) FROM (SELECT (SELECT ti.cid + 1 FROM pragma_table_info(m.name) ti WHERE ti.name = ii.name) AS attnum FROM pragma_index_info(il.name) ii ORDER BY ii.seqno)),
+			NULL
 		FROM main.sqlite_master m
 		JOIN pragma_index_list(m.name) il
 		WHERE m.type = 'table' $$NOTVT$$ AND il."unique" = 1 AND il.origin = 'u'`,
@@ -242,6 +249,44 @@ var catalogViews = []string{
 			0 AS datminmxid,
 			0 AS dattablespace,
 			NULL AS datacl`,
+
+	// pg_enum: postlite has no enum types. The view is empty but typed so the enum
+	// look-ups client introspection performs (e.g. the enum_values sub-select in
+	// NocoDB's columnList) resolve to NULL instead of erroring on a missing relation.
+	`CREATE TEMP VIEW pg_enum AS
+		SELECT 0 AS oid, 0 AS enumtypid, 0 AS enumsortorder, '' AS enumlabel WHERE 0`,
+
+	// pg_get_keywords: PostgreSQL exposes the SQL keyword list as a set-returning
+	// function pg_get_keywords(); psql reads it for tab-completion. SQLite has no such
+	// function, so we provide the data as a view (the rewriter drops the call
+	// parentheses). The list is representative rather than exhaustive — it only drives
+	// client-side completion, never query results.
+	`CREATE TEMP VIEW pg_get_keywords AS
+		SELECT word, 'U' AS catcode, 'unreserved' AS catdesc FROM (
+			SELECT 'abort' AS word UNION ALL SELECT 'add' UNION ALL SELECT 'all' UNION ALL
+			SELECT 'alter' UNION ALL SELECT 'analyze' UNION ALL SELECT 'and' UNION ALL
+			SELECT 'as' UNION ALL SELECT 'asc' UNION ALL SELECT 'begin' UNION ALL
+			SELECT 'between' UNION ALL SELECT 'by' UNION ALL SELECT 'case' UNION ALL
+			SELECT 'cast' UNION ALL SELECT 'check' UNION ALL SELECT 'collate' UNION ALL
+			SELECT 'column' UNION ALL SELECT 'commit' UNION ALL SELECT 'constraint' UNION ALL
+			SELECT 'create' UNION ALL SELECT 'cross' UNION ALL SELECT 'default' UNION ALL
+			SELECT 'delete' UNION ALL SELECT 'desc' UNION ALL SELECT 'distinct' UNION ALL
+			SELECT 'drop' UNION ALL SELECT 'else' UNION ALL SELECT 'end' UNION ALL
+			SELECT 'except' UNION ALL SELECT 'exists' UNION ALL SELECT 'foreign' UNION ALL
+			SELECT 'from' UNION ALL SELECT 'full' UNION ALL SELECT 'group' UNION ALL
+			SELECT 'having' UNION ALL SELECT 'in' UNION ALL SELECT 'index' UNION ALL
+			SELECT 'inner' UNION ALL SELECT 'insert' UNION ALL SELECT 'intersect' UNION ALL
+			SELECT 'into' UNION ALL SELECT 'is' UNION ALL SELECT 'join' UNION ALL
+			SELECT 'left' UNION ALL SELECT 'like' UNION ALL SELECT 'limit' UNION ALL
+			SELECT 'not' UNION ALL SELECT 'null' UNION ALL SELECT 'on' UNION ALL
+			SELECT 'or' UNION ALL SELECT 'order' UNION ALL SELECT 'outer' UNION ALL
+			SELECT 'primary' UNION ALL SELECT 'references' UNION ALL SELECT 'right' UNION ALL
+			SELECT 'rollback' UNION ALL SELECT 'select' UNION ALL SELECT 'set' UNION ALL
+			SELECT 'table' UNION ALL SELECT 'then' UNION ALL SELECT 'union' UNION ALL
+			SELECT 'unique' UNION ALL SELECT 'update' UNION ALL SELECT 'using' UNION ALL
+			SELECT 'values' UNION ALL SELECT 'when' UNION ALL SELECT 'where' UNION ALL
+			SELECT 'with'
+		)`,
 }
 
 // --- static catalog data (filled into the Go virtual tables) ---

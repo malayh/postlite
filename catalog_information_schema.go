@@ -51,12 +51,19 @@ var informationSchemaViews = []string{
 			NULL AS numeric_precision_radix,
 			NULL AS numeric_scale,
 			NULL AS datetime_precision,
+			NULL AS character_set_catalog,
+			NULL AS character_set_schema,
+			NULL AS character_set_name,
+			NULL AS collation_catalog,
+			NULL AS collation_schema,
+			NULL AS collation_name,
 			$$CATALOG$$ AS udt_catalog,
 			'pg_catalog' AS udt_schema,
 			__pg_udt_name(p.type) AS udt_name,
 			'NO' AS is_identity,
 			NULL AS identity_generation,
 			'NEVER' AS is_generated,
+			NULL AS generation_expression,
 			'YES' AS is_updatable
 		FROM main.sqlite_master m
 		JOIN pragma_table_info(m.name) p
