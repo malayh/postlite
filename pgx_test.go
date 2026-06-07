@@ -28,6 +28,39 @@ func pgxConnect(t *testing.T, addr, database string) *pgx.Conn {
 	return conn
 }
 
+// typedSchema exercises the four type families NocoDB relies on most.
+const typedSchema = `
+CREATE TABLE typed (
+	i BIGINT,
+	r DOUBLE PRECISION,
+	b BOOLEAN,
+	t TEXT
+);
+INSERT INTO typed (i, r, b, t) VALUES (42, 3.5, 1, 'hello');
+`
+
+// The headline Phase 4 win: a strict driver scans result columns into native Go
+// types (int64/float64/bool/string), which only works when RowDescription carries
+// real type OIDs and values are encoded in Postgres's text format.
+func TestPgx_ScansTypedValues(t *testing.T) {
+	_, addr := newTestServer(t, typedSchema)
+	conn := pgxConnect(t, addr, "test.db")
+
+	var (
+		i int64
+		r float64
+		b bool
+		s string
+	)
+	if err := conn.QueryRow(context.Background(),
+		"SELECT i, r, b, t FROM typed").Scan(&i, &r, &b, &s); err != nil {
+		t.Fatalf("scan typed row: %v", err)
+	}
+	if i != 42 || r != 3.5 || b != true || s != "hello" {
+		t.Errorf("got (%d, %v, %v, %q), want (42, 3.5, true, hello)", i, r, b, s)
+	}
+}
+
 func TestPgx_ConnectAndParameterizedQuery(t *testing.T) {
 	_, addr := newTestServer(t, seedSchema)
 	conn := pgxConnect(t, addr, "test.db")
@@ -108,6 +141,98 @@ func TestPgx_CommandTagRowsAffected(t *testing.T) {
 	}
 	if tag.RowsAffected() != 4 {
 		t.Errorf("delete RowsAffected = %d, want 4", tag.RowsAffected())
+	}
+}
+
+// A real driver's transaction must be atomic: Rollback discards every write made
+// in the block. This only works if BEGIN, the writes, and ROLLBACK all run on the
+// same underlying SQLite connection (the single-connection refactor).
+func TestPgx_TransactionRollback(t *testing.T) {
+	_, addr := newTestServer(t, seedSchema)
+	conn := pgxConnect(t, addr, "test.db")
+	ctx := context.Background()
+
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if _, err := tx.Exec(ctx, "INSERT INTO products (title) VALUES ('rollme')"); err != nil {
+		t.Fatalf("insert in tx: %v", err)
+	}
+	// Visible inside the transaction. (Counts are scanned as text because all
+	// columns are still advertised as TEXT until Phase 4 assigns real type OIDs.)
+	var inTx string
+	if err := tx.QueryRow(ctx, "SELECT COUNT(*) FROM products WHERE title = 'rollme'").Scan(&inTx); err != nil {
+		t.Fatalf("count in tx: %v", err)
+	}
+	if inTx != "1" {
+		t.Fatalf("inside tx count = %q, want 1", inTx)
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+
+	// Gone after rollback, on the same connection.
+	var after string
+	if err := conn.QueryRow(ctx, "SELECT COUNT(*) FROM products WHERE title = 'rollme'").Scan(&after); err != nil {
+		t.Fatalf("count after rollback: %v", err)
+	}
+	if after != "0" {
+		t.Errorf("after rollback count = %q, want 0", after)
+	}
+}
+
+func TestPgx_TransactionCommit(t *testing.T) {
+	s, addr := newTestServer(t, seedSchema)
+	conn := pgxConnect(t, addr, "test.db")
+	ctx := context.Background()
+
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if _, err := tx.Exec(ctx, "INSERT INTO products (title) VALUES ('keepme')"); err != nil {
+		t.Fatalf("insert in tx: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	// Durable: visible on a separate, direct handle to the file.
+	db := openFileDB(t, s)
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM products WHERE title = 'keepme'`).Scan(&n); err != nil {
+		t.Fatalf("count on file: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("after commit %d rows on disk, want 1", n)
+	}
+}
+
+// pgx surfaces an error inside a transaction, then issues ROLLBACK; the
+// connection must be fully usable afterward.
+func TestPgx_FailedTransactionRecovers(t *testing.T) {
+	_, addr := newTestServer(t, seedSchema)
+	conn := pgxConnect(t, addr, "test.db")
+	ctx := context.Background()
+
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if _, err := tx.Exec(ctx, "INSERT INTO does_not_exist VALUES (1)"); err == nil {
+		t.Fatal("expected an error for a missing table")
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+
+	var name string
+	if err := conn.QueryRow(ctx, "SELECT name FROM users WHERE id = 2").Scan(&name); err != nil {
+		t.Fatalf("connection unusable after aborted tx: %v", err)
+	}
+	if name != "bob" {
+		t.Errorf("name = %q, want bob", name)
 	}
 }
 

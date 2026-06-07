@@ -16,7 +16,6 @@ import (
 	"sync"
 
 	"github.com/jackc/pgproto3/v2"
-	"github.com/jackc/pgtype"
 	"github.com/mattn/go-sqlite3"
 	"golang.org/x/sync/errgroup"
 )
@@ -268,7 +267,7 @@ func (s *Server) serveConn(ctx context.Context, c *Conn) error {
 
 		case *pgproto3.Sync:
 			c.skipUntilSync = false
-			if err := writeMessages(c, &pgproto3.ReadyForQuery{TxStatus: 'I'}); err != nil {
+			if err := writeMessages(c, &pgproto3.ReadyForQuery{TxStatus: c.txStatus}); err != nil {
 				return fmt.Errorf("sync ready: %w", err)
 			}
 
@@ -326,31 +325,41 @@ func (s *Server) handleStartupMessage(ctx context.Context, c *Conn, msg *pgproto
 		return err
 	}
 
+	// Pin a single underlying SQLite connection to this session. Every query,
+	// prepared statement, transaction, attached catalog, and registered function
+	// then shares one connection, so BEGIN/COMMIT/ROLLBACK and the in-memory
+	// pg_catalog behave consistently. A *sql.DB is a pool that could route
+	// statements to different connections, which would break transactions and
+	// hide the attached catalog from later queries.
+	if c.conn, err = c.db.Conn(ctx); err != nil {
+		return fmt.Errorf("pin connection: %w", err)
+	}
+
 	// Attach an in-memory database for pg_catalog.
-	if _, err := c.db.ExecContext(ctx, `ATTACH ':memory:' AS pg_catalog`); err != nil {
+	if _, err := c.conn.ExecContext(ctx, `ATTACH ':memory:' AS pg_catalog`); err != nil {
 		return fmt.Errorf("attach pg_catalog: %w", err)
 	}
 
 	// Register virtual tables to imitate postgres.
-	if _, err := c.db.Exec("CREATE VIRTUAL TABLE IF NOT EXISTS pg_catalog.pg_namespace USING pg_namespace_module (oid, nspname, nspowner, nspacl)"); err != nil {
+	if _, err := c.conn.ExecContext(ctx, "CREATE VIRTUAL TABLE IF NOT EXISTS pg_catalog.pg_namespace USING pg_namespace_module (oid, nspname, nspowner, nspacl)"); err != nil {
 		return fmt.Errorf("create pg_namespace: %w", err)
 	}
-	if _, err := c.db.Exec("CREATE VIRTUAL TABLE IF NOT EXISTS pg_catalog.pg_description USING pg_description_module (objoid, classoid, objsubid, description)"); err != nil {
+	if _, err := c.conn.ExecContext(ctx, "CREATE VIRTUAL TABLE IF NOT EXISTS pg_catalog.pg_description USING pg_description_module (objoid, classoid, objsubid, description)"); err != nil {
 		return fmt.Errorf("create pg_description: %w", err)
 	}
-	if _, err := c.db.Exec("CREATE VIRTUAL TABLE IF NOT EXISTS pg_catalog.pg_database USING pg_database_module (oid, datname, datdba, encoding, datcollate, datctype, datistemplate, datallowconn, datconnlimit, datlastsysoid, datfrozenxid, datminmxid, dattablespace, datacl)"); err != nil {
+	if _, err := c.conn.ExecContext(ctx, "CREATE VIRTUAL TABLE IF NOT EXISTS pg_catalog.pg_database USING pg_database_module (oid, datname, datdba, encoding, datcollate, datctype, datistemplate, datallowconn, datconnlimit, datlastsysoid, datfrozenxid, datminmxid, dattablespace, datacl)"); err != nil {
 		return fmt.Errorf("create pg_database: %w", err)
 	}
-	if _, err := c.db.Exec("CREATE VIRTUAL TABLE IF NOT EXISTS pg_catalog.pg_settings USING pg_settings_module (name, setting, unit, category, short_desc, extra_desc, context, vartype, source, min_val, max_val, enumvals, boot_val, reset_val, sourcefile, sourceline, pending_restart)"); err != nil {
+	if _, err := c.conn.ExecContext(ctx, "CREATE VIRTUAL TABLE IF NOT EXISTS pg_catalog.pg_settings USING pg_settings_module (name, setting, unit, category, short_desc, extra_desc, context, vartype, source, min_val, max_val, enumvals, boot_val, reset_val, sourcefile, sourceline, pending_restart)"); err != nil {
 		return fmt.Errorf("create pg_settings: %w", err)
 	}
-	if _, err := c.db.Exec("CREATE VIRTUAL TABLE IF NOT EXISTS pg_catalog.pg_type USING pg_type_module (oid, typname, typnamespace, typowner, typlen, typbyval, typtype, typcategory, typispreferred, typisdefined, typdelim, typrelid, typelem, typarray, typinput, typoutput, typreceive, typsend, typmodin, typmodout, typanalyze, typalign, typstorage, typnotnull, typbasetype, typtypmod, typndims, typcollation, typdefaultbin, typdefault, typacl)"); err != nil {
+	if _, err := c.conn.ExecContext(ctx, "CREATE VIRTUAL TABLE IF NOT EXISTS pg_catalog.pg_type USING pg_type_module (oid, typname, typnamespace, typowner, typlen, typbyval, typtype, typcategory, typispreferred, typisdefined, typdelim, typrelid, typelem, typarray, typinput, typoutput, typreceive, typsend, typmodin, typmodout, typanalyze, typalign, typstorage, typnotnull, typbasetype, typtypmod, typndims, typcollation, typdefaultbin, typdefault, typacl)"); err != nil {
 		return fmt.Errorf("create pg_type: %w", err)
 	}
-	if _, err := c.db.Exec("CREATE VIRTUAL TABLE IF NOT EXISTS pg_catalog.pg_class USING pg_class_module (oid, relname, relnamespace, reltype, reloftype, relowner, relam, relfilenode, reltablespace, relpages, reltuples, relallvisible, reltoastrelid, relhasindex, relisshared, relpersistence, relkind, relnatts, relchecks, relhasrules, relhastriggers, relhassubclass, relrowsecurity, relforcerowsecurity, relispopulated, relreplident, relispartition, relrewrite, relfrozenxid, relminmxid, relacl, reloptions, relpartbound)"); err != nil {
+	if _, err := c.conn.ExecContext(ctx, "CREATE VIRTUAL TABLE IF NOT EXISTS pg_catalog.pg_class USING pg_class_module (oid, relname, relnamespace, reltype, reloftype, relowner, relam, relfilenode, reltablespace, relpages, reltuples, relallvisible, reltoastrelid, relhasindex, relisshared, relpersistence, relkind, relnatts, relchecks, relhasrules, relhastriggers, relhassubclass, relrowsecurity, relforcerowsecurity, relispopulated, relreplident, relispartition, relrewrite, relfrozenxid, relminmxid, relacl, reloptions, relpartbound)"); err != nil {
 		return fmt.Errorf("create pg_class: %w", err)
 	}
-	if _, err := c.db.Exec("CREATE VIRTUAL TABLE IF NOT EXISTS pg_catalog.pg_range USING pg_range_module (rngtypid, rngsubtype, rngmultitypid, rngcollation, rngsubopc, rngcanonical, rngsubdiff)"); err != nil {
+	if _, err := c.conn.ExecContext(ctx, "CREATE VIRTUAL TABLE IF NOT EXISTS pg_catalog.pg_range USING pg_range_module (rngtypid, rngsubtype, rngmultitypid, rngcollation, rngsubopc, rngcanonical, rngsubdiff)"); err != nil {
 		return fmt.Errorf("create pg_range: %w", err)
 	}
 
@@ -403,8 +412,22 @@ func (s *Server) handleQueryMessage(ctx context.Context, c *Conn, msg *pgproto3.
 	if strings.TrimSpace(query) == "" {
 		return writeMessages(c,
 			&pgproto3.EmptyQueryResponse{},
-			&pgproto3.ReadyForQuery{TxStatus: 'I'},
+			&pgproto3.ReadyForQuery{TxStatus: c.txStatus},
 		)
+	}
+
+	// In a failed transaction block PostgreSQL ignores every command until the
+	// block is ended; only COMMIT/ROLLBACK are honored (both discard the work).
+	kw := leadingKeyword(query)
+	if c.txStatus == txFailed {
+		if isTxCommit(kw) || isTxRollback(kw) {
+			c.rollbackFailed(ctx)
+			return writeMessages(c,
+				&pgproto3.CommandComplete{CommandTag: []byte("ROLLBACK")},
+				&pgproto3.ReadyForQuery{TxStatus: txIdle},
+			)
+		}
+		return writeErrorReady(c, txFailed, errInFailedTransaction)
 	}
 
 	// Statements that return no result set are run with Exec so we can report the
@@ -418,63 +441,96 @@ func (s *Server) handleQueryMessage(ctx context.Context, c *Conn, msg *pgproto3.
 // execSimpleQuery runs a non-row-returning statement (INSERT/UPDATE/DELETE/DDL/
 // SET/...) and reports CommandComplete with the affected-row count.
 func (s *Server) execSimpleQuery(ctx context.Context, c *Conn, query string) error {
-	res, err := c.db.ExecContext(ctx, query)
+	res, err := c.conn.ExecContext(ctx, query)
 	if err != nil {
-		return writeErrorReady(c, 'I', err)
+		return s.failSimple(c, err)
 	}
 	affected, _ := res.RowsAffected()
+	c.noteCompleted(leadingKeyword(query))
 	return writeMessages(c,
 		&pgproto3.CommandComplete{CommandTag: commandTag(query, affected, 0)},
-		&pgproto3.ReadyForQuery{TxStatus: 'I'},
+		&pgproto3.ReadyForQuery{TxStatus: c.txStatus},
 	)
 }
 
 // streamSimpleQuery runs a result-returning statement and streams its rows.
 func (s *Server) streamSimpleQuery(ctx context.Context, c *Conn, query string) error {
-	rows, err := c.db.QueryContext(ctx, query)
+	rows, err := c.conn.QueryContext(ctx, query)
 	if err != nil {
-		return writeErrorReady(c, 'I', err)
+		return s.failSimple(c, err)
 	}
 	defer rows.Close()
 
 	cols, err := rows.ColumnTypes()
 	if err != nil {
-		return writeErrorReady(c, 'I', err)
+		return s.failSimple(c, err)
 	}
+	oids := columnOIDs(cols)
 
 	var buf []byte
 	if len(cols) > 0 {
-		buf = toRowDescription(cols).Encode(buf)
+		buf = toRowDescription(cols, oids).Encode(buf)
 	}
 
 	var n int64
 	for rows.Next() {
-		row, err := scanRow(rows, cols)
+		row, err := scanRow(rows, oids)
 		if err != nil {
-			return writeErrorReady(c, 'I', err)
+			return s.failSimple(c, err)
 		}
 		buf = row.Encode(buf)
 		n++
 	}
 	if err := rows.Err(); err != nil {
-		return writeErrorReady(c, 'I', err)
+		return s.failSimple(c, err)
 	}
 
 	buf = (&pgproto3.CommandComplete{CommandTag: commandTag(query, 0, n)}).Encode(buf)
-	buf = (&pgproto3.ReadyForQuery{TxStatus: 'I'}).Encode(buf)
+	buf = (&pgproto3.ReadyForQuery{TxStatus: c.txStatus}).Encode(buf)
 	_, err = c.Write(buf)
 	return err
 }
 
-func toRowDescription(cols []*sql.ColumnType) *pgproto3.RowDescription {
+// failSimple reports a query-level error during the simple query protocol. An
+// error inside a transaction block moves it to the failed (aborted) state. The
+// connection is never closed; the client recovers immediately.
+func (s *Server) failSimple(c *Conn, err error) error {
+	if c.txStatus == txInProgress {
+		c.txStatus = txFailed
+	}
+	return writeErrorReady(c, c.txStatus, err)
+}
+
+// noteCompleted advances the transaction state after a statement with the given
+// leading keyword completed successfully.
+func (c *Conn) noteCompleted(kw string) {
+	switch {
+	case isTxBegin(kw):
+		c.txStatus = txInProgress
+	case isTxCommit(kw), isTxRollback(kw):
+		c.txStatus = txIdle
+	}
+}
+
+// rollbackFailed ends an aborted transaction block by rolling back the still-open
+// SQLite transaction and returning the session to idle. Most statement errors
+// leave SQLite's transaction open, but a few roll it back implicitly; a "no
+// transaction is active" error here is therefore expected and ignored.
+func (c *Conn) rollbackFailed(ctx context.Context) {
+	_, _ = c.conn.ExecContext(ctx, "ROLLBACK")
+	c.txStatus = txIdle
+}
+
+func toRowDescription(cols []*sql.ColumnType, oids []uint32) *pgproto3.RowDescription {
 	var desc pgproto3.RowDescription
-	for _, col := range cols {
+	for i, col := range cols {
+		oid := oids[i]
 		desc.Fields = append(desc.Fields, pgproto3.FieldDescription{
 			Name:                 []byte(col.Name()),
 			TableOID:             0,
 			TableAttributeNumber: 0,
-			DataTypeOID:          pgtype.TextOID,
-			DataTypeSize:         -1,
+			DataTypeOID:          oid,
+			DataTypeSize:         typeSize(oid),
 			TypeModifier:         -1,
 			Format:               0,
 		})
@@ -482,9 +538,9 @@ func toRowDescription(cols []*sql.ColumnType) *pgproto3.RowDescription {
 	return &desc
 }
 
-func scanRow(rows *sql.Rows, cols []*sql.ColumnType) (*pgproto3.DataRow, error) {
-	refs := make([]interface{}, len(cols))
-	values := make([]interface{}, len(cols))
+func scanRow(rows *sql.Rows, oids []uint32) (*pgproto3.DataRow, error) {
+	refs := make([]interface{}, len(oids))
+	values := make([]interface{}, len(oids))
 	for i := range refs {
 		refs[i] = &values[i]
 	}
@@ -494,18 +550,23 @@ func scanRow(rows *sql.Rows, cols []*sql.ColumnType) (*pgproto3.DataRow, error) 
 		return nil, fmt.Errorf("scan: %w", err)
 	}
 
-	// Convert to TEXT values to return over Postgres wire protocol.
+	// Encode each value into the Postgres text format for its column's type.
 	row := pgproto3.DataRow{Values: make([][]byte, len(values))}
 	for i := range values {
-		row.Values[i] = []byte(fmt.Sprint(values[i]))
+		row.Values[i] = encodeText(oids[i], values[i])
 	}
 	return &row, nil
 }
 
 // failExtended reports a query-level error during the extended protocol. It sends
 // an ErrorResponse and arranges for subsequent messages to be discarded until the
-// client's next Sync (per the Postgres protocol); the connection stays open.
+// client's next Sync (per the Postgres protocol); the connection stays open. An
+// error inside a transaction block moves it to the failed (aborted) state, which
+// is reported by the ReadyForQuery sent on Sync.
 func (s *Server) failExtended(c *Conn, err error) error {
+	if c.txStatus == txInProgress {
+		c.txStatus = txFailed
+	}
 	c.skipUntilSync = true
 	return writeError(c, err)
 }
@@ -518,7 +579,7 @@ func (s *Server) handleParseMessage(ctx context.Context, c *Conn, msg *pgproto3.
 		log.Printf("query rewrite: %s", query)
 	}
 
-	stmt, err := c.db.PrepareContext(ctx, query)
+	stmt, err := c.conn.PrepareContext(ctx, query)
 	if err != nil {
 		return s.failExtended(c, fmt.Errorf("prepare: %w", err))
 	}
@@ -574,10 +635,19 @@ func (s *Server) handleDescribeMessage(ctx context.Context, c *Conn, msg *pgprot
 		if !ok {
 			return s.failExtended(c, fmt.Errorf("portal %q does not exist", msg.Name))
 		}
+		// In a failed transaction, describing a portal must not execute it: only
+		// COMMIT/ROLLBACK are allowed, and they produce no rows.
+		if c.txStatus == txFailed {
+			kw := leadingKeyword(p.ps.query)
+			if isTxCommit(kw) || isTxRollback(kw) {
+				return writeMessages(c, &pgproto3.NoData{})
+			}
+			return s.failExtended(c, errInFailedTransaction)
+		}
 		if err := p.execute(ctx); err != nil {
 			return s.failExtended(c, err)
 		}
-		return writeMessages(c, rowDescriptionOrNoData(p.cols))
+		return writeMessages(c, rowDescriptionOrNoData(p.cols, p.oids))
 	default:
 		return s.failExtended(c, fmt.Errorf("invalid Describe object type %q", msg.ObjectType))
 	}
@@ -600,8 +670,8 @@ func (s *Server) describeStatement(ctx context.Context, c *Conn, ps *preparedSta
 
 	// Report parameter types as unspecified (OID 0); clients then send parameters
 	// as text, which is all this server consumes.
-	oids := make([]uint32, ps.nparams)
-	return writeMessages(c, &pgproto3.ParameterDescription{ParameterOIDs: oids}, rowDescriptionOrNoData(cols))
+	paramOIDs := make([]uint32, ps.nparams)
+	return writeMessages(c, &pgproto3.ParameterDescription{ParameterOIDs: paramOIDs}, rowDescriptionOrNoData(cols, columnOIDs(cols)))
 }
 
 // handleExecuteMessage runs a bound portal and streams its rows, then reports
@@ -611,6 +681,18 @@ func (s *Server) handleExecuteMessage(ctx context.Context, c *Conn, msg *pgproto
 	if !ok {
 		return s.failExtended(c, fmt.Errorf("portal %q does not exist", msg.Portal))
 	}
+
+	// In a failed transaction block only COMMIT/ROLLBACK are honored; both end
+	// the block by discarding its work.
+	kw := leadingKeyword(p.ps.query)
+	if c.txStatus == txFailed {
+		if isTxCommit(kw) || isTxRollback(kw) {
+			c.rollbackFailed(ctx)
+			return writeMessages(c, &pgproto3.CommandComplete{CommandTag: []byte("ROLLBACK")})
+		}
+		return s.failExtended(c, errInFailedTransaction)
+	}
+
 	if err := p.execute(ctx); err != nil {
 		return s.failExtended(c, err)
 	}
@@ -619,7 +701,7 @@ func (s *Server) handleExecuteMessage(ctx context.Context, c *Conn, msg *pgproto
 	var streamed int64
 	if p.rows != nil {
 		for p.rows.Next() {
-			row, err := scanRow(p.rows, p.cols)
+			row, err := scanRow(p.rows, p.oids)
 			if err != nil {
 				p.close()
 				return s.failExtended(c, err)
@@ -638,6 +720,7 @@ func (s *Server) handleExecuteMessage(ctx context.Context, c *Conn, msg *pgproto
 	if p.result != nil {
 		affected, _ = p.result.RowsAffected()
 	}
+	c.noteCompleted(kw)
 	buf = (&pgproto3.CommandComplete{CommandTag: commandTag(p.ps.query, affected, streamed)}).Encode(buf)
 	_, err := c.Write(buf)
 	return err
@@ -665,17 +748,20 @@ func (s *Server) handleCloseMessage(ctx context.Context, c *Conn, msg *pgproto3.
 
 // rowDescriptionOrNoData returns a RowDescription when the statement produces
 // columns, otherwise NoData.
-func rowDescriptionOrNoData(cols []*sql.ColumnType) pgproto3.Message {
+func rowDescriptionOrNoData(cols []*sql.ColumnType, oids []uint32) pgproto3.Message {
 	if len(cols) == 0 {
 		return &pgproto3.NoData{}
 	}
-	return toRowDescription(cols)
+	return toRowDescription(cols, oids)
 }
 
 type Conn struct {
 	net.Conn
 	backend *pgproto3.Backend
-	db      *sql.DB // sqlite database
+	db      *sql.DB   // sqlite database handle (a connection pool)
+	conn    *sql.Conn // the single underlying connection pinned to this session
+
+	txStatus byte // 'I' idle, 'T' in a transaction, 'E' in a failed transaction
 
 	// Extended-protocol session state.
 	stmts         map[string]*preparedStatement // by name ("" = unnamed)
@@ -702,6 +788,7 @@ type boundPortal struct {
 	executed bool
 	rows     *sql.Rows
 	cols     []*sql.ColumnType
+	oids     []uint32
 	result   sql.Result
 	execErr  error
 }
@@ -736,7 +823,7 @@ func (p *boundPortal) execute(ctx context.Context) error {
 		p.execErr = err
 		return err
 	}
-	p.rows, p.cols = rows, cols
+	p.rows, p.cols, p.oids = rows, cols, columnOIDs(cols)
 	return nil
 }
 
@@ -749,10 +836,11 @@ func (p *boundPortal) close() {
 
 func newConn(conn net.Conn) *Conn {
 	return &Conn{
-		Conn:    conn,
-		backend: pgproto3.NewBackend(pgproto3.NewChunkReader(conn), conn),
-		stmts:   make(map[string]*preparedStatement),
-		portals: make(map[string]*boundPortal),
+		Conn:     conn,
+		backend:  pgproto3.NewBackend(pgproto3.NewChunkReader(conn), conn),
+		txStatus: txIdle,
+		stmts:    make(map[string]*preparedStatement),
+		portals:  make(map[string]*boundPortal),
 	}
 }
 
@@ -763,6 +851,13 @@ func (c *Conn) Close() (err error) {
 	for _, ps := range c.stmts {
 		if ps.stmt != nil {
 			ps.stmt.Close()
+		}
+	}
+
+	// Release the pinned connection back to the pool before closing the pool.
+	if c.conn != nil {
+		if e := c.conn.Close(); err == nil {
+			err = e
 		}
 	}
 

@@ -99,10 +99,32 @@ func objectTag(query, kw string) string {
 	return kw
 }
 
+// Transaction status codes reported in ReadyForQuery.
+const (
+	txIdle       byte = 'I' // not in a transaction block
+	txInProgress byte = 'T' // in a transaction block
+	txFailed     byte = 'E' // in a failed (aborted) transaction block
+)
+
+// errInFailedTransaction is returned for any statement (other than COMMIT or
+// ROLLBACK) issued while the transaction is in the aborted state, mirroring
+// PostgreSQL, which ignores commands until the transaction block ends.
+var errInFailedTransaction = errors.New("current transaction is aborted, commands ignored until end of transaction block")
+
+// Transaction-control keyword classifiers. PostgreSQL also spells these START
+// TRANSACTION / END / ABORT; we recognize the synonyms so the session's
+// transaction state is tracked regardless of which the client uses.
+func isTxBegin(kw string) bool    { return kw == "BEGIN" || kw == "START" }
+func isTxCommit(kw string) bool   { return kw == "COMMIT" || kw == "END" }
+func isTxRollback(kw string) bool { return kw == "ROLLBACK" || kw == "ABORT" }
+
 // sqlState maps an error to a best-effort five-character SQLSTATE code so clients
 // can branch on err.Code. The mapping is deliberately coarse; SQLite does not
 // expose Postgres error codes.
 func sqlState(err error) string {
+	if errors.Is(err, errInFailedTransaction) {
+		return "25P02" // in_failed_sql_transaction
+	}
 	var serr sqlite3.Error
 	if errors.As(err, &serr) {
 		switch serr.Code {
