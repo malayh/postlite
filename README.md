@@ -1,4 +1,4 @@
-Postlite ![Status](https://img.shields.io/badge/status-unmaintained-yellow)
+Postlite
 ========
 
 Postlite is a network proxy to allow access to remote SQLite databases over the
@@ -12,9 +12,11 @@ information so Postlite mirrors this catalog by using an attached in-memory
 database with virtual tables. The proxy also performs minor rewriting on these
 system queries to convert them to usable SQLite syntax.
 
-_Note: This software was a proof of concept of wrapping SQLite with the Postgres
-wire protocol. It is no longer maintained. You're welcome to fork this project if
-you're interested in continuing development._
+Postlite implements enough of the PostgreSQL 14 wire protocol — real type OIDs,
+transactions, a populated `pg_catalog`/`information_schema`, command tags, and DDL
+translation — that strict client libraries (pgx, node-postgres, JDBC) and GUI
+tools can connect, introspect the schema, read and edit rows, and manage tables as
+if they were talking to a real PostgreSQL instance.
 
 
 ## Usage
@@ -41,15 +43,16 @@ The image bundles the server so you can mount a single SQLite file and connect t
 it over the Postgres protocol with a username and password.
 
 ```sh
-$ docker build -t postlite .
-
 $ docker run -d --name postlite -p 5432:5432 \
     -e POSTLITE_DATABASE=/data/app.db \
     -e POSTLITE_USER=postgres \
     -e POSTLITE_PASSWORD=secret \
     -v "$PWD/app.db:/data/app.db" \
-    postlite
+    malayh/postlite:latest
 ```
+
+(To build the image yourself instead of pulling it, run `docker build -t
+malayh/postlite:latest .` first, or `make build-image`.)
 
 Then connect with any Postgres client. In single-file mode the database name in
 the connection string is arbitrary — every connection is served the mounted file:
@@ -65,7 +68,7 @@ create its `-wal`/`-journal` siblings next to the database.
 A `docker-compose.yml` is included for a one-command start:
 
 ```sh
-$ docker compose up --build
+$ docker compose up
 ```
 
 ### Configuration

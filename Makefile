@@ -8,7 +8,13 @@ TAGS    ?= vtable
 DATA_DIR ?= ./data
 export CGO_ENABLED = 1
 
-.PHONY: test build run vet fmt tidy
+# Docker image settings. IMAGE is the Docker Hub repository to build/push to and
+# DOCKER_USER is the account used for `docker login`.
+DOCKER      ?= docker
+IMAGE       ?= malayh/postlite
+DOCKER_USER ?= malayh
+
+.PHONY: test build run vet fmt tidy docker-login build-image push-image
 
 test:
 	$(GO) test -tags $(TAGS) ./...
@@ -27,3 +33,26 @@ fmt:
 
 tidy:
 	$(GO) mod tidy
+
+# --- Docker image ---------------------------------------------------------
+
+# Authenticate with Docker Hub as DOCKER_USER (prompts for the password/token).
+docker-login:
+	$(DOCKER) login -u $(DOCKER_USER)
+
+# Build the image tagged :latest (and :$(VERSION) too when VERSION is set).
+build-image:
+	$(DOCKER) build -t $(IMAGE):latest $(if $(VERSION),-t $(IMAGE):$(VERSION),) .
+
+# Build and push a release. Pass the version non-interactively with
+#   make push-image VERSION=1.2.3
+# or run `make push-image` and you'll be prompted for it. Pushes both the
+# version tag and :latest to $(IMAGE).
+push-image:
+	@VERSION="$(VERSION)"; \
+	if [ -z "$$VERSION" ]; then printf "Release version (e.g. 1.2.3): "; read VERSION; fi; \
+	if [ -z "$$VERSION" ]; then echo "error: a version is required" >&2; exit 1; fi; \
+	echo "Building and pushing $(IMAGE):$$VERSION (and :latest)"; \
+	$(DOCKER) build -t $(IMAGE):$$VERSION -t $(IMAGE):latest . && \
+	$(DOCKER) push $(IMAGE):$$VERSION && \
+	$(DOCKER) push $(IMAGE):latest
