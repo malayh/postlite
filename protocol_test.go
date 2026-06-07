@@ -254,6 +254,32 @@ func TestProtocol_VersionLooksLikePostgres(t *testing.T) {
 	if len(r.rows) != 1 || !strings.HasPrefix(r.rows[0][0], "PostgreSQL 14") {
 		t.Errorf("version() = %v, want a 'PostgreSQL 14...' string", r.rows)
 	}
+	// The column must be named "version" exactly as PostgreSQL labels it: strict
+	// clients (Knex/node-postgres, used by NocoDB) run `select version()` and read
+	// the result by row.version. SQLite would otherwise label it "version()" and
+	// the client reads undefined, rejecting the connection.
+	if got := r.colNames(); len(got) != 1 || got[0] != "version" {
+		t.Errorf("version() column names = %v, want [version]", got)
+	}
+}
+
+// SHOW <setting> must return a single column named after the setting (PostgreSQL's
+// behavior), because NocoDB's PgClient runs "SHOW server_version" and reads the
+// result by row.server_version.
+func TestProtocol_ShowServerVersionColumnName(t *testing.T) {
+	_, addr := newTestServer(t, seedSchema)
+	c := dial(t, addr, "test.db")
+
+	r := c.simpleQuery("SHOW server_version")
+	if r.err != nil {
+		t.Fatalf("SHOW server_version error: %s", r.err.Message)
+	}
+	if got := r.colNames(); len(got) != 1 || got[0] != "server_version" {
+		t.Errorf("SHOW server_version column names = %v, want [server_version]", got)
+	}
+	if len(r.rows) != 1 || r.rows[0][0] != ServerVersion {
+		t.Errorf("SHOW server_version = %v, want [[%s]]", r.rows, ServerVersion)
+	}
 }
 
 func TestProtocol_StartupReportsServerParameters(t *testing.T) {

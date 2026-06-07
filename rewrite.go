@@ -22,11 +22,39 @@ func rewrite(q string) string {
 		return `SELECT '' AS "string_agg" WHERE 1 = 2`
 	}
 
+	// NocoDB's columnList is a large per-table column-metadata query whose PK
+	// sub-select uses "LATERAL UNNEST(pc.conkey) WITH ORDINALITY" (no SQLite
+	// equivalent) and takes eight bind parameters. Recognize it (the pk_constraint_
+	// name1 alias is unique to it) and answer it from information_schema_columns plus
+	// pragma-derived primary-key / unique-column joins, keeping all eight $-params.
+	if strings.Contains(q, "pk_constraint_name1") {
+		return columnListQuery
+	}
+
+	// NocoDB's relationList enumerates foreign keys with a PostgreSQL-specific
+	// "LEFT JOIN LATERAL UNNEST(pc.conkey/confkey) WITH ORDINALITY" join that SQLite
+	// cannot parse. It is distinguished from columnList by unnesting confkey (the
+	// referenced-column side) too. Answer it from pragma_foreign_key_list, which
+	// already yields one row per foreign-key column (its seq column is the composite-
+	// key position the WITH ORDINALITY join reconstructs), producing the same result
+	// columns (ts, cstn, tn, cn, foreign_table_schema, rtn, rcn, ur, dr).
+	if strings.Contains(q, "UNNEST(pc.confkey)") {
+		return fkRelationListQuery
+	}
+
 	// SET / RESET configure session GUCs that PostgreSQL tracks but SQLite has no
 	// notion of. Accept and ignore them so session setup does not fail.
 	switch leadingKeyword(trimmed) {
 	case "SET", "RESET":
 		return `SELECT 'SET'`
+	}
+
+	// CREATE/DROP DATABASE have no SQLite equivalent. A postlite "database" is just a
+	// SQLite file (the single mounted file, or one created on first connect), so it
+	// effectively always exists; accept these as no-ops rather than erroring. NocoDB
+	// issues CREATE DATABASE from createDatabaseIfNotExists when adding a source.
+	if m := databaseDDLRegex.FindStringSubmatch(trimmed); m != nil {
+		return "SELECT '" + strings.ToUpper(m[1]) + " DATABASE'"
 	}
 
 	// DDL translation (Tier 3): serial/sequences/PostgreSQL type names -> SQLite.
@@ -58,8 +86,13 @@ func rewrite(q string) string {
 	// into the function calls we register.
 	q = systemFunctionRegex.ReplaceAllString(q, "$1()$2")
 
-	// "SHOW name" -> "SELECT show('name')".
-	q = showRegex.ReplaceAllString(q, "SELECT show('$1')")
+	// "SHOW name" -> "SELECT show('name') AS "name"". The alias matters: PostgreSQL
+	// names the result column after the setting, and strict clients read it by that
+	// name (NocoDB's PgClient runs "SHOW server_version" and reads row.server_version).
+	q = showRegex.ReplaceAllStringFunc(q, func(m string) string {
+		name := strings.ToLower(showRegex.FindStringSubmatch(m)[1])
+		return `SELECT show('` + name + `') AS "` + name + `"`
+	})
 
 	return q
 }
@@ -88,14 +121,19 @@ var (
 	// (varchar(10)) and array ([]) forms.
 	castRegex = regexp.MustCompile(`::\s*(?:"[^"]*"|\w+(?:\.\w+)?)(?:\s*\([^)]*\))?(?:\s*\[\])*`)
 
-	// pg_catalog. schema qualifier.
-	pgCatalogRegex = regexp.MustCompile(`\bpg_catalog\.`)
+	// pg_catalog. schema qualifier. Case-insensitive: clients (NocoDB) emit mixed
+	// case like PG_CATALOG./INFORMATION_SCHEMA.; SQLite resolves the remaining
+	// identifier case-insensitively to the lower-cased catalog object.
+	pgCatalogRegex = regexp.MustCompile(`(?i)\bpg_catalog\.`)
 
-	// information_schema. schema qualifier.
-	informationSchemaRegex = regexp.MustCompile(`\binformation_schema\.`)
+	// information_schema. schema qualifier (case-insensitive, see above).
+	informationSchemaRegex = regexp.MustCompile(`(?i)\binformation_schema\.`)
 
 	// SHOW name.
 	showRegex = regexp.MustCompile(`(?i)^\s*SHOW\s+(\w+)`)
+
+	// CREATE/DROP DATABASE (a no-op in postlite's one-file-per-database model).
+	databaseDDLRegex = regexp.MustCompile(`(?i)^\s*(CREATE|DROP)\s+DATABASE\b`)
 
 	// OPERATOR( [pg_catalog.] <op> ).
 	operatorRegex = regexp.MustCompile(`(?i)OPERATOR\s*\(\s*(?:pg_catalog\.)?\s*([^)\s]+)\s*\)`)
@@ -106,6 +144,86 @@ var (
 	// = ANY('{ ... }'[::type]).
 	anyBraceRegex = regexp.MustCompile(`(?i)=\s*ANY\s*\(\s*'\{([^}]*)\}'\s*(?:::\s*[\w".\[\] ]+)?\)`)
 )
+
+// fkRelationListQuery is the SQLite equivalent of NocoDB's relationList
+// foreign-key query (see rewrite). It keeps a single $1 placeholder for the schema
+// filter so the bound-parameter count still matches, and maps SQLite's on_update /
+// on_delete action text onto PostgreSQL's single-character confupdtype/confdeltype
+// codes. postlite reports every object in the "public" schema (relnamespace 2200).
+const fkRelationListQuery = `SELECT
+	'public' AS ts,
+	m.name || '_' || fk.id || '_fkey' AS cstn,
+	m.name AS tn,
+	fk."from" AS cn,
+	'public' AS foreign_table_schema,
+	fk."table" AS rtn,
+	fk."to" AS rcn,
+	CASE fk.on_update WHEN 'CASCADE' THEN 'c' WHEN 'SET NULL' THEN 'n' WHEN 'SET DEFAULT' THEN 'd' WHEN 'RESTRICT' THEN 'r' ELSE 'a' END AS ur,
+	CASE fk.on_delete WHEN 'CASCADE' THEN 'c' WHEN 'SET NULL' THEN 'n' WHEN 'SET DEFAULT' THEN 'd' WHEN 'RESTRICT' THEN 'r' ELSE 'a' END AS dr
+FROM main.sqlite_master m
+JOIN pragma_foreign_key_list(m.name) fk
+WHERE m.type = 'table' AND m.name NOT LIKE 'sqlite_%' AND 'public' = $1
+ORDER BY tn`
+
+// columnListQuery is the SQLite equivalent of NocoDB's relationList-free
+// columnList query (see rewrite). It returns the same result columns NocoDB reads
+// per column (tn, cn, dt, au, ck, clen, np, ns, dp, cop, nrqd, cdf,
+// generation_expression, character_octet_length, csn, pk_ordinal_position,
+// pk_constraint_name, pk_ordinal_position1, pk_constraint_name1, udt_name,
+// udt_schema, ii, is_unique, enum_values, udt_typtype), drawing columns from
+// information_schema_columns and primary-key / unique membership from pragma joins.
+// It keeps all eight $-placeholders, referenced in order so SQLite's positional
+// bind maps the eight values correctly; only the schema ($7) and table ($8) filter,
+// the rest are NULL-safe no-ops. postlite has no NocoDB autoincrement triggers,
+// enums, generated columns or character sets, so au/enum_values/generation_
+// expression/csn are NULL and udt_typtype is the base-type marker 'b'.
+const columnListQuery = `SELECT
+	c.table_name AS tn,
+	c.column_name AS cn,
+	c.data_type AS dt,
+	NULL AS au,
+	pk.constraint_type AS ck,
+	c.character_maximum_length AS clen,
+	c.numeric_precision AS np,
+	c.numeric_scale AS ns,
+	c.datetime_precision AS dp,
+	c.ordinal_position AS cop,
+	c.is_nullable AS nrqd,
+	c.column_default AS cdf,
+	NULL AS generation_expression,
+	c.character_octet_length AS character_octet_length,
+	NULL AS csn,
+	pk.ordinal_position AS pk_ordinal_position,
+	pk.constraint_name AS pk_constraint_name,
+	pk.ordinal_position AS pk_ordinal_position1,
+	pk.constraint_name AS pk_constraint_name1,
+	c.udt_name AS udt_name,
+	c.udt_schema AS udt_schema,
+	c.is_identity AS ii,
+	CASE WHEN uq.column_name IS NOT NULL THEN 1 ELSE NULL END AS is_unique,
+	NULL AS enum_values,
+	'b' AS udt_typtype
+FROM information_schema_columns c
+LEFT JOIN (
+	SELECT m.name AS table_name, ti.name AS column_name,
+	       'p' AS constraint_type, ti.pk AS ordinal_position,
+	       m.name || '_pkey' AS constraint_name
+	FROM main.sqlite_master m
+	JOIN pragma_table_info(m.name) ti
+	WHERE m.type = 'table' AND ti.pk > 0
+) pk ON pk.table_name = c.table_name AND pk.column_name = c.column_name
+LEFT JOIN (
+	SELECT m.name AS table_name, ii2.name AS column_name
+	FROM main.sqlite_master m
+	JOIN pragma_index_list(m.name) il
+	JOIN pragma_index_info(il.name) ii2
+	WHERE m.type = 'table' AND il."unique" = 1 AND il.origin <> 'pk'
+	      AND (SELECT count(*) FROM pragma_index_info(il.name)) = 1
+	GROUP BY m.name, ii2.name
+) uq ON uq.table_name = c.table_name AND uq.column_name = c.column_name
+WHERE $1 IS $1 AND $2 IS $2 AND $3 IS $3 AND $4 IS $4 AND $5 IS $5 AND $6 IS $6
+      AND c.table_schema = $7 AND c.table_name = $8
+ORDER BY c.table_name, c.ordinal_position`
 
 // unwrapOperator turns a matched OPERATOR(pg_catalog.<op>) into a SQLite operator.
 // Pattern-matching operators map onto LIKE/REGEXP; anything else collapses to the

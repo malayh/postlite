@@ -49,6 +49,124 @@ func introspectColumns(t *testing.T, conn *pgx.Conn, table string) []columnMeta 
 	return cols
 }
 
+// TestE2E_NocoDBRelationList runs NocoDB's exact foreign-key introspection query,
+// which uses PostgreSQL-only "LEFT JOIN LATERAL UNNEST(...) WITH ORDINALITY".
+// postlite recognizes the shape and answers it from pragma_foreign_key_list, so
+// the seed FK products.owner_id -> users.id comes back with the columns NocoDB
+// reads (tn, cn, rtn, rcn, ur, dr).
+func TestE2E_NocoDBRelationList(t *testing.T) {
+	_, addr := newTestServer(t, seedSchema)
+	conn := pgxConnect(t, addr, "test.db")
+	ctx := context.Background()
+
+	const q = `SELECT
+          sch.nspname    AS ts,
+          pc.conname     AS cstn,
+          tbl.relname    AS tn,
+          col.attname    AS cn,
+          f_sch.nspname  AS foreign_table_schema,
+          f_tbl.relname  AS rtn,
+          f_col.attname  AS rcn,
+          pc.confupdtype AS ur,
+          pc.confdeltype AS dr
+        FROM pg_constraint pc
+          LEFT JOIN LATERAL UNNEST(pc.conkey)  WITH ORDINALITY AS u(attnum, attposition)   ON TRUE
+          LEFT JOIN LATERAL UNNEST(pc.confkey) WITH ORDINALITY AS f_u(attnum, attposition) ON f_u.attposition = u.attposition
+          JOIN pg_class tbl ON tbl.oid = pc.conrelid
+          JOIN pg_namespace sch ON sch.oid = tbl.relnamespace
+          LEFT JOIN pg_attribute col ON (col.attrelid = tbl.oid AND col.attnum = u.attnum)
+          LEFT JOIN pg_class f_tbl ON f_tbl.oid = pc.confrelid
+          LEFT JOIN pg_namespace f_sch ON f_sch.oid = f_tbl.relnamespace
+          LEFT JOIN pg_attribute f_col ON (f_col.attrelid = f_tbl.oid AND f_col.attnum = f_u.attnum)
+        WHERE pc.contype = 'f' AND sch.nspname = $1 AND f_sch.nspname = sch.nspname
+        ORDER BY tn`
+
+	rows, err := conn.Query(ctx, q, "public")
+	if err != nil {
+		t.Fatalf("relationList query: %v", err)
+	}
+	defer rows.Close()
+
+	type rel struct{ ts, cstn, tn, cn, fts, rtn, rcn, ur, dr string }
+	var got []rel
+	for rows.Next() {
+		var r rel
+		if err := rows.Scan(&r.ts, &r.cstn, &r.tn, &r.cn, &r.fts, &r.rtn, &r.rcn, &r.ur, &r.dr); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		got = append(got, r)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("relationList rows = %d, want 1 (%+v)", len(got), got)
+	}
+	if r := got[0]; r.tn != "products" || r.cn != "owner_id" || r.rtn != "users" || r.rcn != "id" {
+		t.Errorf("FK = %s.%s -> %s.%s, want products.owner_id -> users.id", r.tn, r.cn, r.rtn, r.rcn)
+	}
+	if r := got[0]; r.ts != "public" || r.fts != "public" {
+		t.Errorf("schemas = %s / %s, want public / public", r.ts, r.fts)
+	}
+}
+
+// TestE2E_NocoDBColumnList drives NocoDB's columnList shape (detected by the
+// pk_constraint_name1 alias) with its eight bind parameters. postlite swaps the
+// whole statement for its information_schema_columns equivalent; this verifies the
+// replacement executes over the extended protocol and reports the products columns
+// with the primary key (id) flagged via ck = 'p'.
+func TestE2E_NocoDBColumnList(t *testing.T) {
+	_, addr := newTestServer(t, seedSchema)
+	conn := pgxConnect(t, addr, "test.db")
+	ctx := context.Background()
+
+	const q = `select c.table_name as tn, pk1.constraint_name as pk_constraint_name1
+		from information_schema.columns c
+		where c.table_catalog=$1 and c.table_schema=$2 and c.table_name=$3
+		  and $4=$4 and $5=$5 and $6=$6 and $7=$7 and $8=$8`
+
+	// Args map to the rewritten query's $1..$8; only $7 (schema) and $8 (table)
+	// filter. Pass NocoDB's real semantics: catalog, schema, schema, table, table,
+	// catalog, schema, table.
+	rows, err := conn.Query(ctx, q, "test.db", "public", "public", "products", "products", "test.db", "public", "products")
+	if err != nil {
+		t.Fatalf("columnList query: %v", err)
+	}
+	defer rows.Close()
+
+	ckByCol := map[string]any{}
+	var order []string
+	for rows.Next() {
+		v, err := rows.Values()
+		if err != nil {
+			t.Fatalf("values: %v", err)
+		}
+		// Column order is fixed by columnListQuery: tn=0, cn=1, ..., ck=4.
+		cn, _ := v[1].(string)
+		order = append(order, cn)
+		ckByCol[cn] = v[4]
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+
+	want := []string{"id", "title", "price", "owner_id"}
+	if len(order) != len(want) {
+		t.Fatalf("columns = %v, want %v", order, want)
+	}
+	for i, c := range want {
+		if order[i] != c {
+			t.Errorf("column %d = %q, want %q", i, order[i], c)
+		}
+	}
+	if ck, _ := ckByCol["id"].(string); ck != "p" {
+		t.Errorf("id ck = %v, want \"p\" (primary key)", ckByCol["id"])
+	}
+	if ckByCol["title"] != nil {
+		t.Errorf("title ck = %v, want nil (not a primary key)", ckByCol["title"])
+	}
+}
+
 func TestE2E_GuiIntrospection(t *testing.T) {
 	_, addr := newTestServer(t, seedSchema)
 	conn := pgxConnect(t, addr, "test.db")

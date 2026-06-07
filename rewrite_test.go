@@ -18,7 +18,9 @@ func TestRewrite(t *testing.T) {
 		{"set-trailing-ws", "  SET TIME ZONE 'UTC'", "SELECT 'SET'"},
 		{"reset", "RESET ALL", "SELECT 'SET'"},
 		{"pg_catalog-strip", "SELECT * FROM pg_catalog.pg_class", "SELECT * FROM pg_class"},
+		{"pg_catalog-strip-upper", "SELECT * FROM PG_CATALOG.pg_class", "SELECT * FROM pg_class"},
 		{"information_schema", "SELECT * FROM information_schema.tables", "SELECT * FROM information_schema_tables"},
+		{"information_schema-upper", "SELECT * FROM INFORMATION_SCHEMA.views", "SELECT * FROM information_schema_views"},
 		{"cast-regclass", "SELECT 'users'::regclass", "SELECT 'users'"},
 		{"cast-text", "SELECT 'x'::text", "SELECT 'x'"},
 		{"cast-oid", "SELECT relname FROM pg_class WHERE oid = '5'::oid", "SELECT relname FROM pg_class WHERE oid = '5'"},
@@ -27,12 +29,82 @@ func TestRewrite(t *testing.T) {
 		{"any-array", "WHERE relkind = ANY(ARRAY['r','v'])", "WHERE relkind IN ('r','v')"},
 		{"any-brace", "WHERE relkind = ANY('{r,v}')", "WHERE relkind IN ('r', 'v')"},
 		{"bare-current_schema", "SELECT current_schema", "SELECT current_schema()"},
-		{"show", "SHOW search_path", "SELECT show('search_path')"},
+		{"show", "SHOW search_path", `SELECT show('search_path') AS "search_path"`},
+		{"create-database", `CREATE DATABASE "kalki" ENCODING 'UTF8'`, `SELECT 'CREATE DATABASE'`},
+		{"drop-database", "DROP DATABASE kalki", `SELECT 'DROP DATABASE'`},
 	}
 	for _, tc := range cases {
 		if got := rewrite(tc.in); got != tc.want {
 			t.Errorf("%s: rewrite(%q) = %q, want %q", tc.name, tc.in, got, tc.want)
 		}
+	}
+}
+
+// pgColumnName must rename a bare function/aggregate-call label to the function
+// name (PostgreSQL's column naming) while leaving aliases and plain columns alone.
+func TestPgColumnName(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"version()", "version"},
+		{"VERSION()", "version"},
+		{"now()", "now"},
+		{"count(*)", "count"},
+		{"max(a)", "max"},
+		{"coalesce(max(a), 0)", "coalesce"},
+		{"current_database()", "current_database"},
+		// Not bare function calls: left unchanged.
+		{"id", "id"},
+		{"server_version", "server_version"},
+		{"a + b", "a + b"},
+		{"f(x) + 1", "f(x) + 1"},
+		{"'literal'", "'literal'"},
+	}
+	for _, tc := range cases {
+		if got := pgColumnName(tc.in); got != tc.want {
+			t.Errorf("pgColumnName(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// The relationList foreign-key query (LATERAL UNNEST ... WITH ORDINALITY) has no
+// SQLite equivalent token-for-token; rewrite swaps the whole statement for a
+// pragma_foreign_key_list query, keeping the single $1 schema placeholder.
+func TestRewriteFKRelationList(t *testing.T) {
+	in := `SELECT pc.conname FROM pg_constraint pc
+		LEFT JOIN LATERAL UNNEST(pc.conkey)  WITH ORDINALITY AS u(attnum, attposition) ON TRUE
+		LEFT JOIN LATERAL UNNEST(pc.confkey) WITH ORDINALITY AS f_u(attnum, attposition) ON TRUE
+		WHERE pc.contype = 'f' AND sch.nspname = $1`
+	got := rewrite(in)
+	if strings.Contains(got, "UNNEST") {
+		t.Errorf("UNNEST not rewritten: %q", got)
+	}
+	if !strings.Contains(got, "pragma_foreign_key_list") {
+		t.Errorf("expected pragma_foreign_key_list, got %q", got)
+	}
+	if strings.Count(got, "$1") != 1 {
+		t.Errorf("rewritten query must keep exactly one $1 (bind-param count), got %q", got)
+	}
+}
+
+// NocoDB's columnList query also contains UNNEST(pc.conkey) (in a PK sub-select)
+// but takes eight bind parameters. It must NOT be mistaken for relationList (one
+// param); rewrite swaps it for the information_schema_columns equivalent that keeps
+// all eight $-placeholders.
+func TestRewriteColumnList(t *testing.T) {
+	in := `select c.table_name as tn, pk1.constraint_name as pk_constraint_name1
+		from information_schema.columns c
+		LEFT JOIN LATERAL UNNEST(pc.conkey) WITH ORDINALITY AS u(attnum, attposition) ON TRUE
+		where c.table_catalog=$6 and c.table_schema=$7 and c.table_name=$8`
+	got := rewrite(in)
+	if strings.Contains(got, "UNNEST") {
+		t.Errorf("UNNEST not rewritten: %q", got)
+	}
+	for _, n := range []string{"$1", "$2", "$3", "$4", "$5", "$6", "$7", "$8"} {
+		if !strings.Contains(got, n) {
+			t.Errorf("rewritten columnList must keep %s (8 bind params), got %q", n, got)
+		}
+	}
+	if strings.Contains(got, "$9") {
+		t.Errorf("rewritten columnList must not introduce a 9th param: %q", got)
 	}
 }
 

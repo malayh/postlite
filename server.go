@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 
@@ -66,9 +67,6 @@ func init() {
 			}
 			if err := conn.CreateModule("pg_description_module", &pgDescriptionModule{}); err != nil {
 				return fmt.Errorf("cannot register pg_description module")
-			}
-			if err := conn.CreateModule("pg_database_module", &pgDatabaseModule{}); err != nil {
-				return fmt.Errorf("cannot register pg_database module")
 			}
 			if err := conn.CreateModule("pg_settings_module", &pgSettingsModule{}); err != nil {
 				return fmt.Errorf("cannot register pg_settings module")
@@ -380,9 +378,6 @@ func (s *Server) handleStartupMessage(ctx context.Context, c *Conn, msg *pgproto
 	if _, err := c.conn.ExecContext(ctx, "CREATE VIRTUAL TABLE IF NOT EXISTS pg_catalog.pg_description USING pg_description_module (objoid, classoid, objsubid, description)"); err != nil {
 		return fmt.Errorf("create pg_description: %w", err)
 	}
-	if _, err := c.conn.ExecContext(ctx, "CREATE VIRTUAL TABLE IF NOT EXISTS pg_catalog.pg_database USING pg_database_module (oid, datname, datdba, encoding, datcollate, datctype, datistemplate, datallowconn, datconnlimit, datlastsysoid, datfrozenxid, datminmxid, dattablespace, datacl)"); err != nil {
-		return fmt.Errorf("create pg_database: %w", err)
-	}
 	if _, err := c.conn.ExecContext(ctx, "CREATE VIRTUAL TABLE IF NOT EXISTS pg_catalog.pg_settings USING pg_settings_module (name, setting, unit, category, short_desc, extra_desc, context, vartype, source, min_val, max_val, enumvals, boot_val, reset_val, sourcefile, sourceline, pending_restart)"); err != nil {
 		return fmt.Errorf("create pg_settings: %w", err)
 	}
@@ -565,7 +560,7 @@ func toRowDescription(cols []*sql.ColumnType, oids []uint32) *pgproto3.RowDescri
 	for i, col := range cols {
 		oid := oids[i]
 		desc.Fields = append(desc.Fields, pgproto3.FieldDescription{
-			Name:                 []byte(col.Name()),
+			Name:                 []byte(pgColumnName(col.Name())),
 			TableOID:             0,
 			TableAttributeNumber: 0,
 			DataTypeOID:          oid,
@@ -575,6 +570,26 @@ func toRowDescription(cols []*sql.ColumnType, oids []uint32) *pgproto3.RowDescri
 		})
 	}
 	return &desc
+}
+
+// funcCallLabel matches a result-column label that is a single bare function or
+// aggregate call, e.g. "version()", "count(*)", "now()", "max(a)".
+var funcCallLabel = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_]*)\s*\(.*\)$`)
+
+// pgColumnName maps a SQLite result-column label to the column name PostgreSQL
+// would assign the same select-list item. SQLite labels an unaliased expression
+// with its literal source text (e.g. "version()", "count(*)"), whereas PostgreSQL
+// names a bare function or aggregate call after the function itself, lower-cased
+// ("version", "count"). Strict clients look the column up by that PostgreSQL name
+// — Knex/node-postgres (NocoDB) run `select version()` and read row.version, so a
+// "version()" label reads back undefined and they reject the connection ("Invalid
+// version response"). Aliased items and plain column references already match
+// PostgreSQL and are returned unchanged.
+func pgColumnName(label string) string {
+	if m := funcCallLabel.FindStringSubmatch(label); m != nil {
+		return strings.ToLower(m[1])
+	}
+	return label
 }
 
 func scanRow(rows *sql.Rows, oids []uint32) (*pgproto3.DataRow, error) {

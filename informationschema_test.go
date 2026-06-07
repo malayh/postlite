@@ -8,6 +8,32 @@ import "testing"
 // the multi-view joins used to discover primary and foreign keys — against the
 // seed schema (users, products, products.owner_id -> users.id).
 
+// information_schema must be reachable case-insensitively: NocoDB's viewList issues
+// "SELECT * FROM INFORMATION_SCHEMA.views" (uppercase schema), which must resolve to
+// the information_schema_views temp view instead of erroring "no such table".
+func TestInfoSchema_ViewsUppercase(t *testing.T) {
+	_, addr := newTestServer(t, seedSchema)
+	c := dial(t, addr, "test.db")
+
+	if r := c.simpleQuery("CREATE VIEW active_users AS SELECT id, name FROM users"); r.err != nil {
+		t.Fatalf("create view: %s", r.err.Message)
+	}
+
+	r := c.simpleQuery("SELECT * FROM INFORMATION_SCHEMA.views WHERE table_schema = 'public'")
+	if r.err != nil {
+		t.Fatalf("INFORMATION_SCHEMA.views query: %s", r.err.Message)
+	}
+	found := false
+	for _, row := range r.rows {
+		if row[2] == "active_users" { // table_name is the 3rd column of the view
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("INFORMATION_SCHEMA.views did not list the created view; rows=%v", r.rows)
+	}
+}
+
 func TestInfoSchema_Tables(t *testing.T) {
 	_, addr := newTestServer(t, seedSchema)
 	c := dial(t, addr, "test.db")

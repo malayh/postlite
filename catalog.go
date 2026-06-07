@@ -193,6 +193,28 @@ var catalogViews = []string{
 		SELECT 0 AS oid, '' AS proname, 11 AS pronamespace, 10 AS proowner,
 		       0 AS prolang, 0 AS prorettype, '' AS proargtypes, 0 AS pronargs
 		WHERE 0`,
+
+	// pg_database: one row for the database this session connected to. postlite
+	// serves one SQLite file per connection, so the only database that "exists" from
+	// a session's point of view is its own. Clients list databases and check for a
+	// database's existence here (e.g. NocoDB's createDatabaseIfNotExists runs
+	// "SELECT datname FROM pg_database WHERE datistemplate=false AND datname=$1").
+	`CREATE TEMP VIEW pg_database AS
+		SELECT
+			1 AS oid,
+			` + catalogNameToken + ` AS datname,
+			10 AS datdba,
+			6 AS encoding,
+			'C' AS datcollate,
+			'C' AS datctype,
+			0 AS datistemplate,
+			1 AS datallowconn,
+			-1 AS datconnlimit,
+			0 AS datlastsysoid,
+			0 AS datfrozenxid,
+			0 AS datminmxid,
+			0 AS dattablespace,
+			NULL AS datacl`,
 }
 
 // --- static catalog data (filled into the Go virtual tables) ---

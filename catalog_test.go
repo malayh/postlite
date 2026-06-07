@@ -26,6 +26,41 @@ func TestCatalog_PgTypePopulated(t *testing.T) {
 	}
 }
 
+// pg_database must list the database the session connected to, so clients that
+// check for a database's existence find it. NocoDB's createDatabaseIfNotExists
+// runs exactly this shape; an empty pg_database made it fall through to
+// "CREATE DATABASE", which SQLite cannot parse.
+func TestCatalog_PgDatabaseListsConnectedDB(t *testing.T) {
+	_, addr := newTestServer(t, seedSchema)
+	c := dial(t, addr, "test.db")
+
+	r := c.simpleQuery("SELECT datname FROM pg_catalog.pg_database WHERE datistemplate = false AND datname = 'test.db'")
+	if r.err != nil {
+		t.Fatalf("pg_database query: %s", r.err.Message)
+	}
+	if len(r.rows) != 1 || r.rows[0][0] != "test.db" {
+		t.Errorf("pg_database datname = %v, want [[test.db]]", r.rows)
+	}
+}
+
+// CREATE DATABASE / DROP DATABASE are accepted as no-ops: a postlite database is a
+// SQLite file, so the operation has no SQLite equivalent and must not error.
+func TestCatalog_CreateDropDatabaseNoop(t *testing.T) {
+	_, addr := newTestServer(t, seedSchema)
+	c := dial(t, addr, "test.db")
+
+	if r := c.simpleQuery(`CREATE DATABASE "kalki" ENCODING 'UTF8'`); r.err != nil {
+		t.Fatalf("CREATE DATABASE should be a no-op, got error: %s", r.err.Message)
+	}
+	if r := c.simpleQuery("DROP DATABASE kalki"); r.err != nil {
+		t.Fatalf("DROP DATABASE should be a no-op, got error: %s", r.err.Message)
+	}
+	// The connection must still be usable afterward.
+	if r := c.simpleQuery("SELECT 1"); r.err != nil {
+		t.Fatalf("connection broken after no-op DDL: %s", r.err.Message)
+	}
+}
+
 func TestCatalog_PgClassListsTables(t *testing.T) {
 	_, addr := newTestServer(t, seedSchema)
 	c := dial(t, addr, "test.db")
