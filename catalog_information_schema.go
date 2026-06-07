@@ -33,7 +33,7 @@ var informationSchemaViews = []string{
 			'NO' AS is_typed,
 			NULL AS commit_action
 		FROM main.sqlite_master m
-		WHERE m.type IN ('table','view') AND m.name NOT LIKE 'sqlite_%'`,
+		WHERE m.type IN ('table','view') AND m.name NOT LIKE 'sqlite_%' $$NOTVT$$`,
 
 	`CREATE TEMP VIEW information_schema_columns AS
 		SELECT
@@ -60,7 +60,7 @@ var informationSchemaViews = []string{
 			'YES' AS is_updatable
 		FROM main.sqlite_master m
 		JOIN pragma_table_info(m.name) p
-		WHERE m.type IN ('table','view') AND m.name NOT LIKE 'sqlite_%'`,
+		WHERE m.type IN ('table','view') AND m.name NOT LIKE 'sqlite_%' $$NOTVT$$`,
 
 	`CREATE TEMP VIEW information_schema_key_column_usage AS
 		SELECT
@@ -75,7 +75,7 @@ var informationSchemaViews = []string{
 			NULL AS position_in_unique_constraint
 		FROM main.sqlite_master m
 		JOIN pragma_table_info(m.name) p
-		WHERE m.type = 'table' AND p.pk > 0
+		WHERE m.type = 'table' $$NOTVT$$ AND p.pk > 0
 		UNION ALL
 		SELECT
 			$$CATALOG$$,
@@ -89,7 +89,7 @@ var informationSchemaViews = []string{
 			fk.seq + 1
 		FROM main.sqlite_master m
 		JOIN pragma_foreign_key_list(m.name) fk
-		WHERE m.type = 'table'`,
+		WHERE m.type = 'table' $$NOTVT$$`,
 
 	`CREATE TEMP VIEW information_schema_table_constraints AS
 		SELECT
@@ -103,22 +103,23 @@ var informationSchemaViews = []string{
 			'NO' AS is_deferrable,
 			'NO' AS initially_deferred
 		FROM main.sqlite_master m
-		WHERE m.type = 'table'
-		  AND EXISTS (SELECT 1 FROM pragma_table_info(m.name) p WHERE p.pk > 0)
+		JOIN pragma_table_info(m.name) p ON p.pk > 0
+		WHERE m.type = 'table' $$NOTVT$$
+		GROUP BY m.name
 		UNION ALL
 		SELECT
 			$$CATALOG$$, 'public', m.name || '_' || fk.id || '_fkey',
 			$$CATALOG$$, 'public', m.name, 'FOREIGN KEY', 'NO', 'NO'
 		FROM main.sqlite_master m
 		JOIN pragma_foreign_key_list(m.name) fk
-		WHERE m.type = 'table' AND fk.seq = 0
+		WHERE m.type = 'table' $$NOTVT$$ AND fk.seq = 0
 		UNION ALL
 		SELECT
 			$$CATALOG$$, 'public', il.name,
 			$$CATALOG$$, 'public', m.name, 'UNIQUE', 'NO', 'NO'
 		FROM main.sqlite_master m
 		JOIN pragma_index_list(m.name) il
-		WHERE m.type = 'table' AND il."unique" = 1 AND il.origin = 'u'`,
+		WHERE m.type = 'table' $$NOTVT$$ AND il."unique" = 1 AND il.origin = 'u'`,
 
 	`CREATE TEMP VIEW information_schema_referential_constraints AS
 		SELECT
@@ -133,7 +134,7 @@ var informationSchemaViews = []string{
 			COALESCE(fk.on_delete, 'NO ACTION') AS delete_rule
 		FROM main.sqlite_master m
 		JOIN pragma_foreign_key_list(m.name) fk
-		WHERE m.type = 'table' AND fk.seq = 0`,
+		WHERE m.type = 'table' $$NOTVT$$ AND fk.seq = 0`,
 
 	`CREATE TEMP VIEW information_schema_constraint_column_usage AS
 		SELECT
@@ -146,14 +147,14 @@ var informationSchemaViews = []string{
 			m.name || '_' || fk.id || '_fkey' AS constraint_name
 		FROM main.sqlite_master m
 		JOIN pragma_foreign_key_list(m.name) fk
-		WHERE m.type = 'table'
+		WHERE m.type = 'table' $$NOTVT$$
 		UNION ALL
 		SELECT
 			$$CATALOG$$, 'public', m.name, p.name,
 			$$CATALOG$$, 'public', m.name || '_pkey'
 		FROM main.sqlite_master m
 		JOIN pragma_table_info(m.name) p
-		WHERE m.type = 'table' AND p.pk > 0`,
+		WHERE m.type = 'table' $$NOTVT$$ AND p.pk > 0`,
 
 	`CREATE TEMP VIEW information_schema_views AS
 		SELECT

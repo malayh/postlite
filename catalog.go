@@ -28,6 +28,31 @@ import (
 // constant.
 const catalogNameToken = "$$CATALOG$$"
 
+// notVirtualToken is replaced in catalog view SQL with notVirtualPredicate. The
+// derived catalogs walk main.sqlite_master and call pragma table-valued functions
+// (pragma_table_info / pragma_index_list / pragma_foreign_key_list) on every row;
+// a virtual table (e.g. an FTS5 table) appears in sqlite_master as type='table',
+// and touching it with a pragma forces SQLite to load its module. postlite's build
+// does not include fts5/rtree/etc., so that load fails with "no such module: fts5"
+// and aborts the whole introspection query. PostgreSQL has no such tables anyway,
+// so exclude them — and their internal shadow tables — from every catalog walk.
+const notVirtualToken = "$$NOTVT$$"
+
+// notVirtualPredicate excludes virtual tables and their shadow tables from a
+// sqlite_master walk aliased "m". It has three parts:
+//   - the table itself is classified virtual or shadow by pragma_table_list (which,
+//     unlike the pragma_* functions above, reads cached schema metadata and so is
+//     safe to call even when the module is missing);
+//   - shadow tables whose owning module is absent are NOT flagged "shadow" by
+//     SQLite (shadow marking runs through the module's xShadowName callback), so we
+//     also drop any table whose name is "<virtualtable>_<suffix>" — a virtual table
+//     is always classified "virtual" from its CREATE syntax, no module required.
+// Every term references only "m", so SQLite evaluates them at the outer-table loop
+// level, before the pragma TVF is invoked for that row — the excluded table is
+// never touched.
+const notVirtualPredicate = `AND m.name NOT IN (SELECT name FROM pragma_table_list WHERE schema = 'main' AND type IN ('virtual','shadow'))
+		AND NOT EXISTS (SELECT 1 FROM pragma_table_list v WHERE v.schema = 'main' AND v.type = 'virtual' AND m.name LIKE v.name || '\_%' ESCAPE '\')`
+
 // createCatalogViews creates the derived catalog temp views on the session's
 // pinned connection. Temp objects are per-connection, so each session gets its own
 // always-live view of its database, with the catalog name templated in.
@@ -35,6 +60,7 @@ func createCatalogViews(ctx context.Context, conn *sql.Conn, dbName string) erro
 	lit := sqlStringLiteral(dbName)
 	for _, stmt := range catalogViews {
 		stmt = strings.ReplaceAll(stmt, catalogNameToken, lit)
+		stmt = strings.ReplaceAll(stmt, notVirtualToken, notVirtualPredicate)
 		if _, err := conn.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("catalog view: %w\n%s", err, stmt)
 		}
@@ -88,7 +114,7 @@ var catalogViews = []string{
 			'' AS relacl,
 			'' AS reloptions
 		FROM main.sqlite_master m
-		WHERE m.type IN ('table','view','index') AND m.name NOT LIKE 'sqlite_%'`,
+		WHERE m.type IN ('table','view','index') AND m.name NOT LIKE 'sqlite_%' $$NOTVT$$`,
 
 	// pg_attribute: one row per column of a table/view (attnum is 1-based, like pg).
 	`CREATE TEMP VIEW pg_attribute AS
@@ -115,7 +141,7 @@ var catalogViews = []string{
 			'' AS attoptions
 		FROM main.sqlite_master m
 		JOIN pragma_table_info(m.name) p
-		WHERE m.type IN ('table','view') AND m.name NOT LIKE 'sqlite_%'`,
+		WHERE m.type IN ('table','view') AND m.name NOT LIKE 'sqlite_%' $$NOTVT$$`,
 
 	// pg_index: one row per index (including the auto indexes SQLite creates for PK
 	// and UNIQUE). indexrelid/indrelid are synthesized but stable.
@@ -135,7 +161,7 @@ var catalogViews = []string{
 			1 AS indislive
 		FROM main.sqlite_master m
 		JOIN pragma_index_list(m.name) il
-		WHERE m.type = 'table'`,
+		WHERE m.type = 'table' $$NOTVT$$`,
 
 	// pg_constraint: primary keys, foreign keys and unique constraints, unioned.
 	`CREATE TEMP VIEW pg_constraint AS
@@ -156,8 +182,9 @@ var catalogViews = []string{
 			'' AS confdeltype,
 			'' AS confmatchtype
 		FROM main.sqlite_master m
-		WHERE m.type = 'table'
-		  AND EXISTS (SELECT 1 FROM pragma_table_info(m.name) p WHERE p.pk > 0)
+		JOIN pragma_table_info(m.name) p ON p.pk > 0
+		WHERE m.type = 'table' $$NOTVT$$
+		GROUP BY m.rowid, m.name
 		UNION ALL
 		SELECT
 			m.rowid * 1000000 + 1000 + fk.id AS oid,
@@ -173,7 +200,7 @@ var catalogViews = []string{
 			'f'
 		FROM main.sqlite_master m
 		JOIN pragma_foreign_key_list(m.name) fk
-		WHERE m.type = 'table' AND fk.seq = 0
+		WHERE m.type = 'table' $$NOTVT$$ AND fk.seq = 0
 		UNION ALL
 		SELECT
 			m.rowid * 1000000 + 2000 + il.seq AS oid,
@@ -185,7 +212,7 @@ var catalogViews = []string{
 			NULL, 0, '', '', ''
 		FROM main.sqlite_master m
 		JOIN pragma_index_list(m.name) il
-		WHERE m.type = 'table' AND il."unique" = 1 AND il.origin = 'u'`,
+		WHERE m.type = 'table' $$NOTVT$$ AND il."unique" = 1 AND il.origin = 'u'`,
 
 	// pg_proc: postlite has no user-defined SQL functions to enumerate. The view is
 	// empty but typed so introspection queries that join against it do not error.

@@ -28,7 +28,7 @@ func rewrite(q string) string {
 	// name1 alias is unique to it) and answer it from information_schema_columns plus
 	// pragma-derived primary-key / unique-column joins, keeping all eight $-params.
 	if strings.Contains(q, "pk_constraint_name1") {
-		return columnListQuery
+		return strings.ReplaceAll(columnListQuery, notVirtualToken, notVirtualPredicate)
 	}
 
 	// NocoDB's relationList enumerates foreign keys with a PostgreSQL-specific
@@ -39,7 +39,7 @@ func rewrite(q string) string {
 	// key position the WITH ORDINALITY join reconstructs), producing the same result
 	// columns (ts, cstn, tn, cn, foreign_table_schema, rtn, rcn, ur, dr).
 	if strings.Contains(q, "UNNEST(pc.confkey)") {
-		return fkRelationListQuery
+		return strings.ReplaceAll(fkRelationListQuery, notVirtualToken, notVirtualPredicate)
 	}
 
 	// SET / RESET configure session GUCs that PostgreSQL tracks but SQLite has no
@@ -162,7 +162,9 @@ const fkRelationListQuery = `SELECT
 	CASE fk.on_delete WHEN 'CASCADE' THEN 'c' WHEN 'SET NULL' THEN 'n' WHEN 'SET DEFAULT' THEN 'd' WHEN 'RESTRICT' THEN 'r' ELSE 'a' END AS dr
 FROM main.sqlite_master m
 JOIN pragma_foreign_key_list(m.name) fk
-WHERE m.type = 'table' AND m.name NOT LIKE 'sqlite_%' AND 'public' = $1
+WHERE m.type = 'table' AND m.name NOT LIKE 'sqlite_%'
+	$$NOTVT$$
+	AND 'public' = $1
 ORDER BY tn`
 
 // columnListQuery is the SQLite equivalent of NocoDB's relationList-free
@@ -210,14 +212,14 @@ LEFT JOIN (
 	       m.name || '_pkey' AS constraint_name
 	FROM main.sqlite_master m
 	JOIN pragma_table_info(m.name) ti
-	WHERE m.type = 'table' AND ti.pk > 0
+	WHERE m.type = 'table' $$NOTVT$$ AND ti.pk > 0
 ) pk ON pk.table_name = c.table_name AND pk.column_name = c.column_name
 LEFT JOIN (
 	SELECT m.name AS table_name, ii2.name AS column_name
 	FROM main.sqlite_master m
 	JOIN pragma_index_list(m.name) il
 	JOIN pragma_index_info(il.name) ii2
-	WHERE m.type = 'table' AND il."unique" = 1 AND il.origin <> 'pk'
+	WHERE m.type = 'table' $$NOTVT$$ AND il."unique" = 1 AND il.origin <> 'pk'
 	      AND (SELECT count(*) FROM pragma_index_info(il.name)) = 1
 	GROUP BY m.name, ii2.name
 ) uq ON uq.table_name = c.table_name AND uq.column_name = c.column_name
