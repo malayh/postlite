@@ -1,0 +1,27 @@
+# Start postlite serving a single mounted SQLite file with password auth:
+#
+#   docker compose up --build
+#
+# Then connect with any Postgres client (the database name is arbitrary in
+# single-file mode):
+#
+#   psql "postgres://postgres:secret@localhost:5432/app?sslmode=disable"
+#
+# Put your SQLite database at ./data/app.db (it is created on first connect if
+# absent).
+services:
+  postlite:
+    build: .
+    ports:
+      - "5432:5432"
+    environment:
+      # Serve this one file to every connection.
+      POSTLITE_DATABASE: /data/app.db
+      # Require password authentication.
+      POSTLITE_USER: postgres
+      POSTLITE_PASSWORD: secret
+    volumes:
+      # Mount a directory (so SQLite can also create app.db-wal / -journal next
+      # to it). Use ./data/app.db as the database file.
+      - ./data:/data
+    restart: unless-stopped

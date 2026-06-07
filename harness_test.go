@@ -33,10 +33,47 @@ func newTestServer(t *testing.T, seedSQL string) (*Server, string) {
 	t.Helper()
 
 	dir := t.TempDir()
+	seedTestDB(t, filepath.Join(dir, "test.db"), seedSQL)
 
-	// Create (and optionally seed) the database file up front so tests have a
-	// deterministic starting point.
-	sdb, err := sql.Open("postlite-sqlite3", filepath.Join(dir, "test.db"))
+	s := NewServer()
+	s.Addr = "127.0.0.1:0"
+	s.DataDir = dir
+	if err := s.Open(); err != nil {
+		t.Fatalf("server open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	return s, s.ln.Addr().String()
+}
+
+// newAuthServer is like newTestServer but requires MD5 password authentication
+// with the given username/password.
+func newAuthServer(t *testing.T, seedSQL, username, password string) (*Server, string) {
+	t.Helper()
+
+	dir := t.TempDir()
+	seedTestDB(t, filepath.Join(dir, "test.db"), seedSQL)
+
+	s := NewServer()
+	s.Addr = "127.0.0.1:0"
+	s.DataDir = dir
+	s.Username = username
+	s.Password = password
+	if err := s.Open(); err != nil {
+		t.Fatalf("server open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	return s, s.ln.Addr().String()
+}
+
+// seedTestDB creates the SQLite file at path and runs seedSQL against it (or, when
+// seedSQL is empty, touches the file so it exists), giving tests a deterministic
+// starting point.
+func seedTestDB(t *testing.T, path, seedSQL string) {
+	t.Helper()
+
+	sdb, err := sql.Open("postlite-sqlite3", path)
 	if err != nil {
 		t.Fatalf("open seed db: %v", err)
 	}
@@ -56,16 +93,6 @@ func newTestServer(t *testing.T, seedSQL string) (*Server, string) {
 	if err := sdb.Close(); err != nil {
 		t.Fatalf("close seed db: %v", err)
 	}
-
-	s := NewServer()
-	s.Addr = "127.0.0.1:0"
-	s.DataDir = dir
-	if err := s.Open(); err != nil {
-		t.Fatalf("server open: %v", err)
-	}
-	t.Cleanup(func() { _ = s.Close() })
-
-	return s, s.ln.Addr().String()
 }
 
 // openFileDB opens the on-disk database directly (bypassing the wire protocol),

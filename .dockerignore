@@ -1,0 +1,11 @@
+# Keep the build context small and reproducible.
+.git
+.github
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+data/
+docker-compose.yml
+*.md
+.claude

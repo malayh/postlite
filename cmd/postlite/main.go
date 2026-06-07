@@ -22,12 +22,15 @@ func main() {
 }
 
 func run(ctx context.Context) error {
-	addr := flag.String("addr", ":5432", "postgres protocol bind address")
-	dataDir := flag.String("data-dir", "", "data directory")
+	addr := flag.String("addr", envOr("POSTLITE_ADDR", ":5432"), "postgres protocol bind address")
+	dataDir := flag.String("data-dir", os.Getenv("POSTLITE_DATA_DIR"), "directory of SQLite databases (a client's database name selects a file within it)")
+	database := flag.String("database", os.Getenv("POSTLITE_DATABASE"), "path to a single SQLite file served to every connection (overrides -data-dir)")
+	username := flag.String("username", envOr("POSTLITE_USER", "postgres"), "username clients must authenticate as when a password is set")
+	password := flag.String("password", os.Getenv("POSTLITE_PASSWORD"), "password clients must supply (MD5 auth); empty disables authentication")
 	flag.Parse()
 
-	if *dataDir == "" {
-		return fmt.Errorf("required: -data-dir PATH")
+	if *dataDir == "" && *database == "" {
+		return fmt.Errorf("required: -data-dir PATH or -database FILE")
 	}
 
 	log.SetFlags(0)
@@ -35,11 +38,19 @@ func run(ctx context.Context) error {
 	s := postlite.NewServer()
 	s.Addr = *addr
 	s.DataDir = *dataDir
+	s.DatabasePath = *database
+	s.Username = *username
+	s.Password = *password
 	if err := s.Open(); err != nil {
 		return err
 	}
 	defer s.Close()
 
+	if *password == "" {
+		log.Printf("warning: no password set; accepting all connections (set POSTLITE_PASSWORD to require authentication)")
+	} else {
+		log.Printf("password authentication enabled for user %q", *username)
+	}
 	log.Printf("listening on %s", s.Addr)
 
 	// Wait on signal before shutting down.
@@ -53,4 +64,13 @@ func run(ctx context.Context) error {
 	log.Printf("postlite shutdown complete")
 
 	return nil
+}
+
+// envOr returns the value of the named environment variable, or def if it is unset
+// or empty.
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
 }

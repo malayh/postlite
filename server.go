@@ -110,8 +110,21 @@ type Server struct {
 	// Bind address to listen to Postgres wire protocol.
 	Addr string
 
-	// Directory that holds SQLite databases.
+	// Directory that holds SQLite databases. A client's requested database name
+	// selects a file within it. Ignored when DatabasePath is set.
 	DataDir string
+
+	// DatabasePath, when non-empty, is a single SQLite file served to every
+	// connection regardless of the database name the client requests. This is the
+	// "mount one .db file" mode used by the Docker image.
+	DatabasePath string
+
+	// Username and Password configure password authentication. When Password is
+	// empty (the default), authentication is disabled and any client may connect.
+	// When Password is set, clients must authenticate with MD5 using Username
+	// (which defaults to "postgres" via the CLI) and Password.
+	Username string
+	Password string
 }
 
 func NewServer() *Server {
@@ -123,9 +136,13 @@ func NewServer() *Server {
 }
 
 func (s *Server) Open() (err error) {
-	// Ensure data directory exists.
-	if _, err := os.Stat(s.DataDir); err != nil {
-		return err
+	// Ensure the data source exists. In single-file mode the database file is
+	// opened (and created if absent) on connect, so only the directory form is
+	// validated up front.
+	if s.DatabasePath == "" {
+		if _, err := os.Stat(s.DataDir); err != nil {
+			return err
+		}
 	}
 
 	s.ln, err = net.Listen("tcp", s.Addr)
@@ -314,6 +331,13 @@ func (s *Server) serveConnStartup(ctx context.Context, c *Conn) error {
 func (s *Server) handleStartupMessage(ctx context.Context, c *Conn, msg *pgproto3.StartupMessage) (err error) {
 	log.Printf("received startup message: %#v", msg)
 
+	// Authenticate before anything else. This mirrors PostgreSQL's flow, where the
+	// server challenges for credentials immediately after the startup packet. When
+	// no password is configured this is a no-op.
+	if err := s.authenticate(c, msg); err != nil {
+		return err
+	}
+
 	// Validate
 	name := getParameter(msg.Parameters, "database")
 	if name == "" {
@@ -322,8 +346,15 @@ func (s *Server) handleStartupMessage(ctx context.Context, c *Conn, msg *pgproto
 		return writeMessages(c, &pgproto3.ErrorResponse{Message: "invalid database name"})
 	}
 
+	// In single-file mode every connection maps to the one mounted file; otherwise
+	// the database name selects a file within the data directory.
+	dbPath := filepath.Join(s.DataDir, name)
+	if s.DatabasePath != "" {
+		dbPath = s.DatabasePath
+	}
+
 	// Open SQL database & attach to the connection.
-	if c.db, err = sql.Open("postlite-sqlite3", filepath.Join(s.DataDir, name)); err != nil {
+	if c.db, err = sql.Open("postlite-sqlite3", dbPath); err != nil {
 		return err
 	}
 
