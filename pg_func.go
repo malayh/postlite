@@ -123,6 +123,17 @@ func show(name string) string {
 // database per connection; we report a stable name.
 func currentDatabase() string { return "postlite" }
 
+// currentSetting implements current_setting(name[, missing_ok]). It returns the
+// run-time parameter value (the same source as SHOW), so e.g.
+// current_setting('timezone') is 'UTC'. An unknown setting yields an empty string.
+func currentSetting(args ...interface{}) string {
+	if len(args) == 0 || args[0] == nil {
+		return ""
+	}
+	name, _ := args[0].(string)
+	return show(name)
+}
+
 // pgGetExpr implements pg_get_expr(expr, relid[, pretty]); we do not store node
 // trees, so the decompiled expression is empty.
 func pgGetExpr(args ...interface{}) string { return "" }
@@ -264,6 +275,7 @@ func sqliteDeclToOID(decl string) int64 { return int64(oidForType(decl)) }
 // the catalog views call.
 var catalogFuncs = map[string]interface{}{
 	"current_database":                   currentDatabase,
+	"current_setting":                    currentSetting,
 	"pg_get_expr":                        pgGetExpr,
 	"pg_get_constraintdef":               pgGetConstraintdef,
 	"pg_get_indexdef":                    pgGetIndexdef,

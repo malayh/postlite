@@ -41,6 +41,13 @@ func rewrite(q string) string {
 	q = anyArrayRegex.ReplaceAllString(q, "IN ($1)")
 	q = anyBraceRegex.ReplaceAllStringFunc(q, rewriteAnyBrace)
 
+	// Timestamp display, as ORMs/GUIs emit it: "<ts> AT TIME ZONE <zone>" and
+	// "TO_CHAR(<ts>, <fmt>)". SQLite has neither. postlite stores timestamps tz-naively
+	// (UTC), so AT TIME ZONE conversions are dropped, and TO_CHAR is rewritten to
+	// strftime (which, unlike a registered function, propagates NULL on a NULL input).
+	q = atTimeZoneRegex.ReplaceAllString(q, "")
+	q = rewriteToChar(q)
+
 	// PostgreSQL functions/constructs with no identical SQLite spelling. These are
 	// general translations (not tied to any one client): they let real introspection
 	// queries — node-postgres/Knex, pgx, psql, DBeaver — run against the catalog as
@@ -158,7 +165,68 @@ var (
 
 	// pg_get_keywords() call parentheses (postlite exposes it as a view).
 	keywordsCallRegex = regexp.MustCompile(`(?i)\bpg_get_keywords\s*\(\s*\)`)
+
+	// "AT TIME ZONE <zone>" where <zone> is a string literal, a function call, or an
+	// identifier. postlite is tz-naive, so the whole clause is dropped.
+	atTimeZoneRegex = regexp.MustCompile(`(?i)\s+AT\s+TIME\s+ZONE\s+(?:'[^']*'|"[^"]*"|\w+\s*\([^)]*\)|\w+(?:\.\w+)?)`)
+
+	// TO_CHAR( — start of a PostgreSQL TO_CHAR() call (rewriteToChar finds its close
+	// paren and translates the format literal).
+	toCharRegex = regexp.MustCompile(`(?i)\bto_char\s*\(`)
 )
+
+// pgToStrftime translates a PostgreSQL TO_CHAR datetime format into a SQLite
+// strftime format. Tokens are ordered longest-first so prefixes (HH before HH24,
+// YY before YYYY, TZH before TZH:TZM) are not mis-replaced. SQLite has no 12-hour or
+// timezone substitutions; since postlite is UTC, the timezone tokens become the
+// literal "+00:00"/"+00".
+var pgToStrftime = strings.NewReplacer(
+	"TZH:TZM", "+00:00",
+	"HH24", "%H",
+	"HH12", "%I",
+	"YYYY", "%Y",
+	"TZH", "+00",
+	"TZM", "00",
+	"US", "%f",
+	"MS", "%f",
+	"MM", "%m",
+	"DD", "%d",
+	"HH", "%H",
+	"MI", "%M",
+	"SS", "%S",
+	"YY", "%Y",
+)
+
+// rewriteToChar rewrites PostgreSQL TO_CHAR(<ts>, '<format>') into SQLite
+// strftime('<format>', <ts>) when the format is a string literal. strftime returns
+// NULL for a NULL timestamp, matching TO_CHAR. Calls whose format is not a literal
+// are left untouched (and the search advances past them).
+func rewriteToChar(q string) string {
+	from := 0
+	for {
+		rel := toCharRegex.FindStringIndex(q[from:])
+		if rel == nil {
+			return q
+		}
+		start, open := from+rel[0], from+rel[1]-1
+		end := matchParen(q, open)
+		if end < 0 {
+			return q
+		}
+		args := splitArgs(q[open+1 : end])
+		if len(args) == 2 {
+			expr := strings.TrimSpace(args[0])
+			format := strings.TrimSpace(args[1])
+			if len(format) >= 2 && format[0] == '\'' && format[len(format)-1] == '\'' {
+				repl := "strftime('" + pgToStrftime.Replace(format[1:len(format)-1]) + "', " + expr + ")"
+				q = q[:start] + repl + q[end+1:]
+				from = start + len(repl)
+				continue
+			}
+		}
+		from = end + 1 // not a form we translate; skip this occurrence
+	}
+}
 
 // rewriteConcat rewrites PostgreSQL CONCAT(a, b, ...) into the SQLite expression
 // (COALESCE(a,”) || COALESCE(b,”) || ...). PostgreSQL's CONCAT treats NULL as the

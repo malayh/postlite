@@ -117,6 +117,33 @@ func TestRewriteFunctions(t *testing.T) {
 	}
 }
 
+// Timestamp display: "<ts> AT TIME ZONE <zone>" is dropped (postlite is tz-naive)
+// and "TO_CHAR(ts, fmt)" becomes strftime, with the PostgreSQL format translated.
+func TestRewriteTimestamp(t *testing.T) {
+	cases := []struct{ name, in, want string }{
+		{
+			"to_char-at-time-zone",
+			`TO_CHAR(("t"."created_at" AT TIME ZONE CURRENT_SETTING('timezone') AT TIME ZONE 'UTC'), 'YYYY-MM-DD HH24:MI:SSTZH:TZM')`,
+			`strftime('%Y-%m-%d %H:%M:%S+00:00', ("t"."created_at"))`,
+		},
+		{
+			"at-time-zone-literal-only",
+			`SELECT ts AT TIME ZONE 'UTC' FROM t`,
+			`SELECT ts FROM t`,
+		},
+		{
+			"to_char-plain",
+			`SELECT TO_CHAR(d, 'YYYY-MM-DD')`,
+			`SELECT strftime('%Y-%m-%d', d)`,
+		},
+	}
+	for _, tc := range cases {
+		if got := rewrite(tc.in); got != tc.want {
+			t.Errorf("%s: rewrite(%q) = %q, want %q", tc.name, tc.in, got, tc.want)
+		}
+	}
+}
+
 func TestRewriteOperator(t *testing.T) {
 	got := rewrite("SELECT 1 WHERE c.relname OPERATOR(pg_catalog.~) '^(users)$'")
 	if strings.Contains(got, "OPERATOR") {
