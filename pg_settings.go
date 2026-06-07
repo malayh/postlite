@@ -140,4 +140,4 @@ type pgSetting struct {
 	pending_restart int
 }
 
-var pgSettings = []pgSetting{}
+// pgSettings is populated in catalog.go.

@@ -196,4 +196,4 @@ type pgType struct {
 	typacl         string
 }
 
-var pgTypes = []pgType{}
+// pgTypes is populated in catalog.go.

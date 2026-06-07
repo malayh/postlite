@@ -28,8 +28,54 @@ func columnOIDs(cols []*sql.ColumnType) []uint32 {
 // oidForColumn picks a PostgreSQL type OID for a result column from its declared
 // SQLite type. Computed columns (COUNT(*), expressions) have no declared type and
 // fall back to text, which every driver can consume.
+//
+// The catalog views expose boolean columns (attnotnull, indisprimary, ...) as 0/1
+// expressions, which SQLite cannot tag with a declared type. So that strict
+// drivers and psql see real PostgreSQL booleans ('t'/'f') rather than the string
+// "0" (which is truthy in some languages), we map those well-known catalog column
+// names to bool when the column has no declared type of its own.
 func oidForColumn(col *sql.ColumnType) uint32 {
-	return oidForType(col.DatabaseTypeName())
+	decl := col.DatabaseTypeName()
+	if decl == "" {
+		if oid, ok := catalogColumnOID[col.Name()]; ok {
+			return oid
+		}
+	}
+	return oidForType(decl)
+}
+
+// catalogColumnOID maps catalog/computed column names to a PostgreSQL OID, used
+// only when SQLite reports no declared type for the column. These are the boolean
+// columns of the pg_catalog views, which must encode as 't'/'f'.
+var catalogColumnOID = map[string]uint32{
+	// pg_class
+	"relhasindex":         pgtype.BoolOID,
+	"relisshared":         pgtype.BoolOID,
+	"relhasrules":         pgtype.BoolOID,
+	"relhastriggers":      pgtype.BoolOID,
+	"relhassubclass":      pgtype.BoolOID,
+	"relrowsecurity":      pgtype.BoolOID,
+	"relforcerowsecurity": pgtype.BoolOID,
+	"relispopulated":      pgtype.BoolOID,
+	"relispartition":      pgtype.BoolOID,
+	// pg_attribute
+	"attnotnull":   pgtype.BoolOID,
+	"atthasdef":    pgtype.BoolOID,
+	"attisdropped": pgtype.BoolOID,
+	"attislocal":   pgtype.BoolOID,
+	// pg_index
+	"indisunique":    pgtype.BoolOID,
+	"indisprimary":   pgtype.BoolOID,
+	"indisexclusion": pgtype.BoolOID,
+	"indimmediate":   pgtype.BoolOID,
+	"indisclustered": pgtype.BoolOID,
+	"indisvalid":     pgtype.BoolOID,
+	"indisready":     pgtype.BoolOID,
+	"indislive":      pgtype.BoolOID,
+	// pg_constraint
+	"condeferrable": pgtype.BoolOID,
+	"condeferred":   pgtype.BoolOID,
+	"convalidated":  pgtype.BoolOID,
 }
 
 // oidForType maps a SQLite declared type name to a PostgreSQL type OID. It follows

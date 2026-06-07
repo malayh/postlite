@@ -11,7 +11,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"sync"
 
@@ -55,6 +54,13 @@ func init() {
 				return fmt.Errorf("cannot register version() function")
 			}
 
+			// Catalog/introspection functions that client libraries and GUIs call.
+			for name, fn := range catalogFuncs {
+				if err := conn.RegisterFunc(name, fn, true); err != nil {
+					return fmt.Errorf("cannot register %s() function: %w", name, err)
+				}
+			}
+
 			if err := conn.CreateModule("pg_namespace_module", &pgNamespaceModule{}); err != nil {
 				return fmt.Errorf("cannot register pg_namespace module")
 			}
@@ -91,10 +97,6 @@ func user() string        { return "sqlite3" }
 func version() string {
 	return "PostgreSQL " + ServerVersion + " (postlite) on x86_64-pc-linux-gnu"
 }
-
-func formatType(type_oid, typemod string) string { return "" }
-
-func show(name string) string { return "" }
 
 type Server struct {
 	mu    sync.Mutex
@@ -356,11 +358,17 @@ func (s *Server) handleStartupMessage(ctx context.Context, c *Conn, msg *pgproto
 	if _, err := c.conn.ExecContext(ctx, "CREATE VIRTUAL TABLE IF NOT EXISTS pg_catalog.pg_type USING pg_type_module (oid, typname, typnamespace, typowner, typlen, typbyval, typtype, typcategory, typispreferred, typisdefined, typdelim, typrelid, typelem, typarray, typinput, typoutput, typreceive, typsend, typmodin, typmodout, typanalyze, typalign, typstorage, typnotnull, typbasetype, typtypmod, typndims, typcollation, typdefaultbin, typdefault, typacl)"); err != nil {
 		return fmt.Errorf("create pg_type: %w", err)
 	}
-	if _, err := c.conn.ExecContext(ctx, "CREATE VIRTUAL TABLE IF NOT EXISTS pg_catalog.pg_class USING pg_class_module (oid, relname, relnamespace, reltype, reloftype, relowner, relam, relfilenode, reltablespace, relpages, reltuples, relallvisible, reltoastrelid, relhasindex, relisshared, relpersistence, relkind, relnatts, relchecks, relhasrules, relhastriggers, relhassubclass, relrowsecurity, relforcerowsecurity, relispopulated, relreplident, relispartition, relrewrite, relfrozenxid, relminmxid, relacl, reloptions, relpartbound)"); err != nil {
-		return fmt.Errorf("create pg_class: %w", err)
-	}
 	if _, err := c.conn.ExecContext(ctx, "CREATE VIRTUAL TABLE IF NOT EXISTS pg_catalog.pg_range USING pg_range_module (rngtypid, rngsubtype, rngmultitypid, rngcollation, rngsubopc, rngcanonical, rngsubdiff)"); err != nil {
 		return fmt.Errorf("create pg_range: %w", err)
+	}
+
+	// Create the catalog objects derived from the live user schema (pg_class,
+	// pg_attribute, ... and information_schema) as temp views over sqlite_master +
+	// pragma functions. These reflect the user's tables, so unlike the static
+	// virtual tables above they cannot be precomputed.
+	c.database = name
+	if err := createCatalogViews(ctx, c.conn, name); err != nil {
+		return fmt.Errorf("create catalog views: %w", err)
 	}
 
 	// Report the parameter set a real PostgreSQL server sends at startup. Drivers
@@ -408,7 +416,7 @@ func (s *Server) handleQueryMessage(ctx context.Context, c *Conn, msg *pgproto3.
 	// Rewrite system-information queries so they're tolerable by SQLite. This is
 	// applied to the simple query protocol too (not just Parse), so e.g. SET works
 	// regardless of which protocol the client uses.
-	query := rewriteQuery(msg.String)
+	query := c.rewrite(msg.String)
 	if strings.TrimSpace(query) == "" {
 		return writeMessages(c,
 			&pgproto3.EmptyQueryResponse{},
@@ -574,7 +582,7 @@ func (s *Server) failExtended(c *Conn, err error) error {
 // handleParseMessage prepares a statement and stores it under the given name
 // ("" is the unnamed statement). It responds with ParseComplete.
 func (s *Server) handleParseMessage(ctx context.Context, c *Conn, msg *pgproto3.Parse) error {
-	query := rewriteQuery(msg.Query)
+	query := c.rewrite(msg.Query)
 	if msg.Query != query {
 		log.Printf("query rewrite: %s", query)
 	}
@@ -761,7 +769,8 @@ type Conn struct {
 	db      *sql.DB   // sqlite database handle (a connection pool)
 	conn    *sql.Conn // the single underlying connection pinned to this session
 
-	txStatus byte // 'I' idle, 'T' in a transaction, 'E' in a failed transaction
+	database string // the database name the client connected with
+	txStatus byte   // 'I' idle, 'T' in a transaction, 'E' in a failed transaction
 
 	// Extended-protocol session state.
 	stmts         map[string]*preparedStatement // by name ("" = unnamed)
@@ -889,41 +898,3 @@ func writeMessages(w io.Writer, msgs ...pgproto3.Message) error {
 	_, err := w.Write(buf)
 	return err
 }
-
-func rewriteQuery(q string) string {
-	// Ignore SET queries by rewriting them to empty resultsets.
-	if strings.HasPrefix(q, "SET ") {
-		return `SELECT 'SET'`
-	}
-
-	// Ignore this god forsaken query for pulling keywords.
-	if strings.Contains(q, `select string_agg(word, ',') from pg_catalog.pg_get_keywords()`) {
-		return `SELECT '' AS "string_agg" WHERE 1 = 2`
-	}
-
-	// Rewrite system information variables so they are functions so we can inject them.
-	// https://www.postgresql.org/docs/9.1/functions-info.html
-	q = systemFunctionRegex.ReplaceAllString(q, "$1()$2")
-
-	// Rewrite double-colon casting by simply removing it.
-	// https://www.postgresql.org/docs/7.3/sql-expressions.html#SQL-SYNTAX-TYPE-CASTS
-	q = castRegex.ReplaceAllString(q, "")
-
-	// Remove references to the pg_catalog.
-	// q = pgCatalogRegex.ReplaceAllString(q, "")
-
-	// Rewrite "SHOW" commands into function calls.
-	q = showRegex.ReplaceAllString(q, "SELECT show('$1')")
-
-	return q
-}
-
-var (
-	systemFunctionRegex = regexp.MustCompile(`\b(current_catalog|current_schema|current_user|session_user|user)\b([^\(]|$)`)
-
-	castRegex = regexp.MustCompile(`::(regclass)`)
-
-	pgCatalogRegex = regexp.MustCompile(`\bpg_catalog\.`)
-
-	showRegex = regexp.MustCompile(`^SHOW (\w+)`)
-)
