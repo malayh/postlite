@@ -127,9 +127,24 @@ func sqlState(err error) string {
 	}
 	var serr sqlite3.Error
 	if errors.As(err, &serr) {
+		// PostgreSQL never returns the bare class code 23000 for a constraint
+		// violation; it returns a specific subclass (23502/23503/23505/23514), and
+		// strict drivers (node-postgres/NocoDB) only handle those subclasses —
+		// "23000 is not handled on database pg". SQLite's *extended* result code
+		// distinguishes which constraint failed, so map it to the matching subclass.
+		switch serr.ExtendedCode {
+		case sqlite3.ErrConstraintNotNull:
+			return "23502" // not_null_violation
+		case sqlite3.ErrConstraintForeignKey:
+			return "23503" // foreign_key_violation
+		case sqlite3.ErrConstraintUnique, sqlite3.ErrConstraintPrimaryKey:
+			return "23505" // unique_violation
+		case sqlite3.ErrConstraintCheck:
+			return "23514" // check_violation
+		}
 		switch serr.Code {
 		case sqlite3.ErrConstraint:
-			return "23000" // integrity_constraint_violation
+			return "23514" // unclassified constraint: report a handled subclass
 		case sqlite3.ErrReadonly:
 			return "25006" // read_only_sql_transaction
 		case sqlite3.ErrError:

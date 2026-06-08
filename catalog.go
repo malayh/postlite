@@ -58,6 +58,12 @@ const notVirtualPredicate = `AND m.name NOT IN (SELECT name FROM pragma_table_li
 // pinned connection. Temp objects are per-connection, so each session gets its own
 // always-live view of its database, with the catalog name templated in.
 func createCatalogViews(ctx context.Context, conn *sql.Conn, dbName string) error {
+	// Reconstruct enum types from IN-list CHECK constraints first: the pg_type,
+	// pg_enum, pg_attribute and information_schema.columns views below read the temp
+	// tables this populates.
+	if err := setupEnumCatalog(ctx, conn); err != nil {
+		return err
+	}
 	lit := sqlStringLiteral(dbName)
 	for _, stmt := range catalogViews {
 		stmt = strings.ReplaceAll(stmt, catalogNameToken, lit)
@@ -123,7 +129,7 @@ var catalogViews = []string{
 			m.rowid AS attrelid,
 			m.name AS attrelname,
 			p.name AS attname,
-			__pg_type_oid(p.type) AS atttypid,
+			COALESCE(ec.typoid, __pg_type_oid(p.type)) AS atttypid,
 			0 AS attstattarget,
 			-1 AS attlen,
 			p.cid + 1 AS attnum,
@@ -142,6 +148,7 @@ var catalogViews = []string{
 			'' AS attoptions
 		FROM main.sqlite_master m
 		JOIN pragma_table_info(m.name) p
+		LEFT JOIN __pg_enum_col ec ON ec.table_name = m.name AND ec.column_name = p.name COLLATE NOCASE
 		WHERE m.type IN ('table','view') AND m.name NOT LIKE 'sqlite_%' $$NOTVT$$`,
 
 	// pg_index: one row per index (including the auto indexes SQLite creates for PK
@@ -250,11 +257,31 @@ var catalogViews = []string{
 			0 AS dattablespace,
 			NULL AS datacl`,
 
-	// pg_enum: postlite has no enum types. The view is empty but typed so the enum
-	// look-ups client introspection performs (e.g. the enum_values sub-select in
-	// NocoDB's columnList) resolve to NULL instead of erroring on a missing relation.
+	// pg_type: shadow the static pg_catalog.pg_type vtable with a temp view that
+	// appends the reconstructed enum types (see enum.go). An unqualified pg_type —
+	// what client queries reach after the pg_catalog. prefix is stripped — resolves
+	// to this view (temp objects take precedence over attached schemas), so an enum's
+	// type row is found by the pg_enum/udt_name joins introspection performs; the
+	// vtable is still reachable by its qualified name for the base rows. The literal
+	// columns below are in the vtable's declared order: an enum is a defined base-less
+	// type (typtype 'e', typcategory 'E').
+	`CREATE TEMP VIEW pg_type AS
+		SELECT * FROM pg_catalog.pg_type
+		UNION ALL
+		SELECT
+			et.oid, et.typname, et.typnamespace, 10, -1, 0, 'e', 'E', 0, 1, ',',
+			0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 'i', 'p', 0, 0, -1, 0, 0, NULL, NULL, NULL
+		FROM __pg_enum_type et`,
+
+	// pg_enum: one row per reconstructed enum label. Empty (so introspection's enum
+	// sub-selects resolve to NULL) when the schema has no IN-list CHECK constraints.
+	// Clients string_agg/group_concat the labels with no ORDER BY and expect them in
+	// sort order; __pg_enum_label's composite PRIMARY KEY makes the enumtypid scan
+	// deliver them in enumsortorder (see enum.go).
 	`CREATE TEMP VIEW pg_enum AS
-		SELECT 0 AS oid, 0 AS enumtypid, 0 AS enumsortorder, '' AS enumlabel WHERE 0`,
+		SELECT (l.enumtypid * 10000 + l.enumsortorder) AS oid,
+		       l.enumtypid AS enumtypid, l.enumsortorder AS enumsortorder, l.enumlabel AS enumlabel
+		FROM __pg_enum_label l`,
 
 	// pg_get_keywords: PostgreSQL exposes the SQL keyword list as a set-returning
 	// function pg_get_keywords(); psql reads it for tab-completion. SQLite has no such

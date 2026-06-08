@@ -44,7 +44,7 @@ var informationSchemaViews = []string{
 			p.cid + 1 AS ordinal_position,
 			p.dflt_value AS column_default,
 			CASE WHEN p."notnull" = 1 OR p.pk > 0 THEN 'NO' ELSE 'YES' END AS is_nullable,
-			__pg_type_name(p.type) AS data_type,
+			CASE WHEN ec.typname IS NOT NULL THEN 'USER-DEFINED' ELSE __pg_type_name(p.type) END AS data_type,
 			NULL AS character_maximum_length,
 			NULL AS character_octet_length,
 			NULL AS numeric_precision,
@@ -58,8 +58,8 @@ var informationSchemaViews = []string{
 			NULL AS collation_schema,
 			NULL AS collation_name,
 			$$CATALOG$$ AS udt_catalog,
-			'pg_catalog' AS udt_schema,
-			__pg_udt_name(p.type) AS udt_name,
+			CASE WHEN ec.typname IS NOT NULL THEN 'public' ELSE 'pg_catalog' END AS udt_schema,
+			COALESCE(ec.typname, __pg_udt_name(p.type)) AS udt_name,
 			'NO' AS is_identity,
 			NULL AS identity_generation,
 			'NEVER' AS is_generated,
@@ -67,6 +67,7 @@ var informationSchemaViews = []string{
 			'YES' AS is_updatable
 		FROM main.sqlite_master m
 		JOIN pragma_table_info(m.name) p
+		LEFT JOIN __pg_enum_col ec ON ec.table_name = m.name AND ec.column_name = p.name COLLATE NOCASE
 		WHERE m.type IN ('table','view') AND m.name NOT LIKE 'sqlite_%' $$NOTVT$$`,
 
 	`CREATE TEMP VIEW information_schema_key_column_usage AS
