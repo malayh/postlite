@@ -37,6 +37,12 @@ func rewrite(q string) string {
 	// SQLite operator.
 	q = operatorRegex.ReplaceAllStringFunc(q, unwrapOperator)
 
+	// ILIKE is PostgreSQL's case-insensitive LIKE (clients like NocoDB emit it for
+	// text search). SQLite has no ILIKE keyword, but its LIKE is already
+	// case-insensitive for ASCII, so map the keyword to LIKE (NOT ILIKE -> NOT LIKE
+	// falls out for free).
+	q = ilikeRegex.ReplaceAllString(q, "LIKE")
+
 	// "x = ANY(ARRAY[...])" and "x = ANY('{...}')" -> "x IN (...)".
 	q = anyArrayRegex.ReplaceAllString(q, "IN ($1)")
 	q = anyBraceRegex.ReplaceAllStringFunc(q, rewriteAnyBrace)
@@ -173,6 +179,9 @@ var (
 	// TO_CHAR( — start of a PostgreSQL TO_CHAR() call (rewriteToChar finds its close
 	// paren and translates the format literal).
 	toCharRegex = regexp.MustCompile(`(?i)\bto_char\s*\(`)
+
+	// ILIKE keyword -> LIKE (SQLite's LIKE is case-insensitive for ASCII).
+	ilikeRegex = regexp.MustCompile(`(?i)\bilike\b`)
 )
 
 // pgToStrftime translates a PostgreSQL TO_CHAR datetime format into a SQLite
